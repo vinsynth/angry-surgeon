@@ -4,22 +4,21 @@ use alloc::vec::Vec;
 use crate::{fs, RingBuf};
 use crate::utils::Fraction;
 
-use crate::timestretch::Onsets;
+use crate::rhythm::RhythmData;
 
 use defmt::{Debug2Format, Format};
-use fugit::HertzU32;
 use micromath::F32Ext;
 
 use embedded_sdmmc::filesystem::ToShortFileName;
 
 use embassy_stm32::peripherals::{DMA2_CH3, SDIO};
+use embassy_stm32::time::Hertz;
 use embassy_time::Instant;
 
 // import end ------------------------------------------------------------------
 
 pub const GRAIN_LEN: usize = 256;
-pub const SAMPLE_RATE: HertzU32 = HertzU32::from_raw(32_000_000);
-pub const STEPS_PER_BEAT: usize = 1;
+pub const SAMPLE_RATE: Hertz = Hertz::khz(32);
 
 pub type VolMgr<'a> = embedded_sdmmc::VolumeManager<fs::SdioCard<'a, SDIO, DMA2_CH3>, fs::DummyTimesource, 4, 4, 1>;
 
@@ -60,7 +59,7 @@ pub struct Steps<'a> {
     vol_mgr: VolMgr<'a>,
     root: embedded_sdmmc::RawDirectory,
     file: Option<embedded_sdmmc::RawFile>,
-    step_count: u32,
+    rhythm: Option<RhythmData>,
     speed: f32,
     speed_mod: Option<f32>,
     running: bool,
@@ -83,13 +82,14 @@ impl<'a> Steps<'a> {
 
         // default to youngest file
         let file = if let Some(name) = file_names.last() {
+            defmt::info!("file: {}", Debug2Format(&name));
             Some(vol_mgr.open_file_in_dir(root, name, embedded_sdmmc::Mode::ReadOnly).await?)
         } else {
             None
         };
 
-        let onsets = if let Some(file) = file {
-            Some(Onsets::new(&mut vol_mgr, &file).await)
+        let rhythm = if let Some(file) = file {
+            Some(RhythmData::new(&mut vol_mgr, &file).await?)
         } else {
             None
         };
@@ -101,7 +101,7 @@ impl<'a> Steps<'a> {
             vol_mgr,
             root,
             file,
-            step_count: 0,
+            rhythm,
             speed: 1.0,
             speed_mod: None,
             running: true,
@@ -109,14 +109,34 @@ impl<'a> Steps<'a> {
         })
     }
 
-    pub async fn load_file<N: ToShortFileName>(&mut self, file_name: N, step_count: u32) -> Result<(), Error> {
+    pub async fn load_file<N: ToShortFileName>(&mut self, file_name: N) -> Result<(), Error> {
         match self.vol_mgr.open_file_in_dir(self.root, file_name, embedded_sdmmc::Mode::ReadOnly).await {
             Ok(file) => {
                 if let Some(file) = self.file {
                     self.vol_mgr.close_file(file).await?;
                 }
                 self.file = Some(file);
-                self.step_count = step_count;
+
+                let rhythm = RhythmData::new(&mut self.vol_mgr, &file).await?;
+                // tempo sync
+                if let Some(old_tempo) = self.rhythm.map(|r| r.tempo()) {
+                    let ratio = (1..=16)
+                        .map(|i| {
+                            let raw = old_tempo / rhythm.tempo();
+                            if raw > 1.0 {
+                                raw / i as f32
+                            } else {
+                                raw * i as f32
+                            }
+                        }).min_by(|&a, &b| {
+                            let ord = (1.0 - a).abs().total_cmp(&(1.0 - b).abs());
+                            defmt::info!("ord: {}", defmt::Debug2Format(&ord));
+                            ord
+                        }).unwrap();
+                    defmt::info!("ratio: {}", ratio);
+                    self.speed *= ratio;
+                }
+                self.rhythm = Some(rhythm);
             },
             Err(embedded_sdmmc::Error::FileAlreadyOpen) => (),
             Err(e) => defmt::panic!("failed to open file: {}", Debug2Format(&e)),
@@ -202,7 +222,7 @@ impl<'a> Steps<'a> {
             let millis = now.duration_since(past).as_millis();
 
             if millis > 17 {
-                let speed = self.step_len().await? as f32 / (millis as f32 * 32.0) * STEPS_PER_BEAT as f32;
+                let speed = self.step_len().await? as f32 / (millis as f32 * 32.0);
                 defmt::info!("speed: {}", speed);
                 self.speed = speed;
                 let offset = (self.file_offset()? / self.step_len().await?) * self.step_len().await? + crate::lock_async_ref!(ANCHOR);
@@ -225,15 +245,15 @@ impl<'a> Steps<'a> {
     }
 
     pub async fn step_len(&self) -> Result<u32, Error> {
-        Ok((self.file_length()? - 0x2c) / self.step_count)
+        Ok((self.file_length()? - 0x2c) / self.step_count().ok_or(Error::NoFileLoaded)? as u32)
     }
 
     pub fn speed(&self) -> f32 {
         self.speed
     }
 
-    pub fn step_count(&self) -> u32 {
-        self.step_count
+    pub fn step_count(&self) -> Option<u8> {
+        self.rhythm.map(|r| r.step_count())
     }
 
     fn file_offset(&self) -> Result<u32, Error> {

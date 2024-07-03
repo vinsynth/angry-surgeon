@@ -1,18 +1,10 @@
-// TODO: reduce stuttering
-//   - ensure channel refill system works (refilling queue as last entry starts being used)
-//   - optimize resampling algorithm (multiple samples at once? full grains at once? faster calc?)
-// TODO: impl Masri HFC -based onset detection
-//   - realtime or calculate on load
-// TODO: impl onset-conscientious timestretch
-//   - same overall length, grains about onset neither removed nor duplicated
-
 #![no_std]
 #![no_main]
 
 mod audio;
 mod fs;
 mod pwm;
-mod timestretch;
+mod rhythm;
 mod utils;
 
 use audio::GRAIN_LEN;
@@ -147,10 +139,10 @@ async fn main(spawner: Spawner) {
     PWM.lock(|p| p.replace(Some(pwm)));
     unsafe { NVIC::unmask(embassy_stm32::interrupt::TIM4) };
 
-    info!("init adc...");
-    let adc = embassy_stm32::adc::Adc::new(p.ADC1);
-    let joy_sw = gpio::Input::new(p.PB13, gpio::Pull::Up);
-    let _ = spawner.spawn(handle_adc(adc, p.PA2, p.PA3, joy_sw));
+    // info!("init adc...");
+    // let adc = embassy_stm32::adc::Adc::new(p.ADC1);
+    // let joy_sw = gpio::Input::new(p.PB13, gpio::Pull::Up);
+    // let _ = spawner.spawn(handle_adc(adc, p.PA2, p.PA3, joy_sw));
 
     info!("init tapper...");
     let tap_sw = ExtiInput::new(p.PB14, p.EXTI14, gpio::Pull::Up);
@@ -241,7 +233,7 @@ async fn handle_matrix(
 ) {
     let mut prev_downs = Vec::new();
     loop {
-        let step_count = lock_async_ref!(STEPS).step_count();
+        let step_count = lock_async_ref!(STEPS).step_count().unwrap();
         let mut downs = prev_downs.clone();
 
         // process matrix
@@ -256,14 +248,14 @@ async fn handle_matrix(
                     downs.push(index);
 
                     if file_input.is_low() && index < 2 {
-                        let (file_name, step_count) = match index {
-                            0 => ("gentle74.wav", 14),
-                            1 => ("amen74.wav", 14),
+                        let file_name = match index {
+                            0 => "gentle74.wav",
+                            1 => "amen74.wav",
                             _ => defmt::unimplemented!(),
                         };
 
                         crate::expect!(
-                            lock_async_mut!(STEPS).load_file(file_name, step_count).await,
+                            lock_async_mut!(STEPS).load_file(file_name).await,
                             "failed to load file"
                         );
                         info!("loaded file {}!", file_name);

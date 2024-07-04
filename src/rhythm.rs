@@ -17,7 +17,7 @@ pub struct RhythmData {
 
 impl RhythmData {
     pub async fn new(vol_mgr: &mut VolMgr<'_>, file: &embedded_sdmmc::RawFile) -> Result<Self, Error> {
-        info!("start onset detection...");
+        info!("calculating Masri HFC...");
         const FFT_LEN: usize = 128;
         const HOP_SIZE: usize = 64;
 
@@ -41,6 +41,7 @@ impl RhythmData {
                 .sum::<f32>();
             energies.push(energy);
         }
+        vol_mgr.file_seek_from_start(*file, 0x2c)?;
 
         // beat correlation detection
         info!("detecting correlation...");
@@ -57,7 +58,6 @@ impl RhythmData {
                     .enumerate()
                     .map(|(j, v)| wavelet(j) * v)
                     .sum::<f32>();
-                info!("i: {}, correlation: {}", i, correlation);
                 (i, correlation)
             })
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
@@ -69,7 +69,6 @@ impl RhythmData {
             60.0;
         info!("step_count: {}, tempo: {}", step_count, tempo);
 
-        vol_mgr.file_seek_from_start(*file, 0x2c)?;
         Ok(RhythmData { step_count, tempo })
     }
 

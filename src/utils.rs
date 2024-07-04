@@ -10,6 +10,7 @@ macro_rules! expect {
     }
 }
 
+/// for `AsyncMutex<Option<..>>`
 #[macro_export]
 macro_rules! lock_async_mut {
     ( $mutex:expr ) => {
@@ -21,6 +22,7 @@ macro_rules! lock_async_mut {
     }
 }
 
+/// for `AsyncMutex<Option<..>>`
 #[macro_export]
 macro_rules! lock_async_ref {
     ( $mutex:expr ) => {

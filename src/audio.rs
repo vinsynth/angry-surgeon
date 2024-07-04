@@ -25,6 +25,7 @@ pub type VolMgr<'a> = embedded_sdmmc::VolumeManager<fs::SdioCard<'a, SDIO, DMA2_
 #[derive(Debug, Format)]
 pub enum Error {
     NoFileLoaded,
+    FilenameError,
     SdmmcError(embedded_sdmmc::Error<embassy_stm32::sdmmc::Error>),
 }
 
@@ -53,14 +54,24 @@ enum State {
     Desync { inner: Desync, step: u32, counter: u32 }
 }
 
+#[derive(Debug, Clone)]
+pub struct Wav {
+    name: embedded_sdmmc::ShortFileName,
+    rhythm: RhythmData,
+}
+
 pub struct Steps<'a> {
     state: State,
     event_buf: RingBuf<Event, 2>,
     vol_mgr: VolMgr<'a>,
     root: embedded_sdmmc::RawDirectory,
     file: Option<embedded_sdmmc::RawFile>,
-    rhythm: Option<RhythmData>,
-    speed: f32,
+    file_names: Vec<embedded_sdmmc::ShortFileName>,
+    pads: [Option<Wav>; 16],
+    pad_index: Option<usize>,
+    anchor_tempo: f32,
+    sync_speed: f32,
+    tap_speed: f32,
     speed_mod: Option<f32>,
     running: bool,
     led: embassy_stm32::gpio::Output<'a>,
@@ -75,78 +86,96 @@ impl<'a> Steps<'a> {
             vol_mgr.iterate_dir(root, |x| {
                 file_infos.push((x.name.clone(), x.ctime));
             }).await?;
-            // file_infos.sort_by_key(|(_, ctime)| *ctime);
+            file_infos.sort_by_key(|(_, ctime)| *ctime);
             file_infos.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
         };
         defmt::info!("files: {}", Debug2Format(&file_names));
-
-        // default to youngest file
-        let file = if let Some(name) = file_names.last() {
-            defmt::info!("file: {}", Debug2Format(&name));
-            Some(vol_mgr.open_file_in_dir(root, name, embedded_sdmmc::Mode::ReadOnly).await?)
-        } else {
-            None
-        };
-
-        let rhythm = if let Some(file) = file {
-            Some(RhythmData::new(&mut vol_mgr, &file).await?)
-        } else {
-            None
-        };
-        let _ = file.map(|f| vol_mgr.file_seek_from_start(f, 0x2c));
 
         Ok(Self {
             state: State::Sync,
             event_buf: RingBuf::new(),
             vol_mgr,
             root,
-            file,
-            rhythm,
-            speed: 1.0,
+            file: None,
+            file_names,
+            pads: core::array::from_fn(|_| None),
+            pad_index: None,
+            anchor_tempo: 0.0,
+            sync_speed: 1.0,
+            tap_speed: 1.0,
             speed_mod: None,
             running: true,
             led,
         })
     }
 
-    pub async fn load_file<N: ToShortFileName>(&mut self, file_name: N) -> Result<(), Error> {
-        match self.vol_mgr.open_file_in_dir(self.root, file_name, embedded_sdmmc::Mode::ReadOnly).await {
-            Ok(file) => {
-                if let Some(file) = self.file {
-                    self.vol_mgr.close_file(file).await?;
-                }
-                self.file = Some(file);
+    pub async fn assign_pad<N: ToShortFileName + Clone>(&mut self, pad_index: &u8, file_name: N) -> Result<(), Error> {
+        defmt::assert!(*pad_index < 16);
 
-                let rhythm = RhythmData::new(&mut self.vol_mgr, &file).await?;
-                // tempo sync
-                if let Some(old_tempo) = self.rhythm.map(|r| r.tempo()) {
-                    let ratio = (1..=16)
-                        .map(|i| {
-                            let raw = old_tempo / rhythm.tempo();
-                            if raw > 1.0 {
-                                raw / i as f32
-                            } else {
-                                raw * i as f32
-                            }
-                        }).min_by(|&a, &b| {
-                            let ord = (1.0 - a).abs().total_cmp(&(1.0 - b).abs());
-                            defmt::info!("ord: {}", defmt::Debug2Format(&ord));
-                            ord
-                        }).unwrap();
-                    defmt::info!("ratio: {}", ratio);
-                    self.speed *= ratio;
-                }
-                self.rhythm = Some(rhythm);
-            },
-            Err(embedded_sdmmc::Error::FileAlreadyOpen) => (),
-            Err(e) => defmt::panic!("failed to open file: {}", Debug2Format(&e)),
+        let name = file_name.to_short_filename().map_err(|_| Error::FilenameError)?;
+        // reuse rhythm from other instance of file, otherwise calculate rhythm
+        let rhythm = if let Some(wav) = self.pads.iter().flatten().find(|p| p.name == name) {
+            wav.rhythm
+        } else {
+            let file = self.vol_mgr.open_file_in_dir(
+                self.root,
+                name.clone(),
+                embedded_sdmmc::Mode::ReadOnly
+            ).await?;
+            let rhythm = RhythmData::new(&mut self.vol_mgr, &file).await?;
+            self.vol_mgr.close_file(file).await?;
+            rhythm
+        };
+
+        if let Some(pad) = self.pads.get_mut(*pad_index as usize) {
+            *pad = Some(Wav { name, rhythm });
         }
 
-        self.file_seek_from_start(0x2c)?;
-        self.event_buf = RingBuf::new();
-        self.state = State::Sync;
-
         Ok(())
+    }
+
+    pub async fn load_pad(&mut self, pad_index: &usize) -> Result<(), Error> {
+        defmt::assert!(*pad_index < 16);
+
+        if let Some(Some(pad)) = self.pads.get(*pad_index) {
+            if let Some(file) = self.file {
+                self.vol_mgr.close_file(file).await?;
+            }
+
+            if self.file.is_some() {
+                // sync to global tempo
+                self.sync_speed = (1..=16)
+                    .map(|i| {
+                        let raw = self.anchor_tempo / pad.rhythm.tempo();
+                        if raw > 1.0 {
+                            raw / i as f32
+                        } else {
+                            raw * i as f32
+                        }
+                    }).min_by(|&a, &b| {
+                        (1.0 - a).abs().total_cmp(&(1.0 - b).abs())
+                    }).unwrap();
+            } else {
+                // anchor global tempo
+                self.anchor_tempo = pad.rhythm.tempo();
+                defmt::info!("anchor tempo: {}", self.anchor_tempo);
+            }
+            self.file = Some(self.vol_mgr.open_file_in_dir(
+                self.root,
+                pad.name.clone(),
+                embedded_sdmmc::Mode::ReadOnly
+            ).await?);
+
+
+            self.file_seek_from_start(0x2c)?;
+            self.event_buf = RingBuf::new();
+            self.state = State::Sync;
+            self.pad_index = Some(*pad_index);
+
+            return Ok(());
+        }
+
+        Err(Error::NoFileLoaded)
     }
 
     pub async fn read_grain(&mut self) -> Result<[u8; GRAIN_LEN], Error> {
@@ -159,8 +188,8 @@ impl<'a> Steps<'a> {
             if let State::Desync {
                 inner: Desync::Loop { length }, step, ..
             } = self.state {
-                let start = step * self.step_len().await?;
-                let end = u32::from((length + step) * Fraction::from(self.step_len().await?));
+                let start = step * self.step_len()?;
+                let end = u32::from((length + step) * Fraction::from(self.step_len()?));
                 let offset = self.file_offset()? - 0x2c;
 
                 if offset > end ||
@@ -175,7 +204,7 @@ impl<'a> Steps<'a> {
 
         // read grain
         let mut out = [u8::MAX / 2; GRAIN_LEN];
-        let speed = self.speed_mod.unwrap_or(self.speed);
+        let speed = self.speed();
         let mut buf = vec![0; (GRAIN_LEN as f32 * speed) as usize].into_boxed_slice();
 
         if let Some(file) = self.file {
@@ -222,38 +251,41 @@ impl<'a> Steps<'a> {
             let millis = now.duration_since(past).as_millis();
 
             if millis > 17 {
-                let speed = self.step_len().await? as f32 / (millis as f32 * 32.0);
-                defmt::info!("speed: {}", speed);
-                self.speed = speed;
-                let offset = (self.file_offset()? / self.step_len().await?) * self.step_len().await? + crate::lock_async_ref!(ANCHOR);
+                let speed = self.step_len()? as f32 / (millis as f32 * (SAMPLE_RATE.0 / 1000) as f32);
+                self.tap_speed = speed;
+                let offset = (self.file_offset()? / self.step_len()?) * self.step_len()? + crate::lock_async_ref!(ANCHOR);
                 defmt::info!("offset: {}", offset);
                 self.file_seek_from_start(offset)?;
             }
         } else {
-            ANCHOR.lock().await.replace(self.file_offset()? % self.step_len().await?);
+            ANCHOR.lock().await.replace(self.file_offset()? % self.step_len()?);
         }
         Ok(Some(now))
+    }
+
+    pub fn set_running(&mut self, running: bool) -> Result<(), Error> {
+        self.running = running;
+        self.file_seek_from_start(0x2c)
     }
 
     pub fn set_speed_mod(&mut self, speed: Option<f32>) {
         self.speed_mod = speed;
     }
 
-    pub async fn set_running(&mut self, running: bool) -> Result<(), Error> {
-        self.running = running;
-        self.file_seek_from_start(0x2c)
-    }
-
-    pub async fn step_len(&self) -> Result<u32, Error> {
+    pub fn step_len(&self) -> Result<u32, Error> {
         Ok((self.file_length()? - 0x2c) / self.step_count().ok_or(Error::NoFileLoaded)? as u32)
     }
 
     pub fn speed(&self) -> f32 {
-        self.speed
+        self.sync_speed * self.tap_speed * self.speed_mod.unwrap_or(1.0)
     }
 
     pub fn step_count(&self) -> Option<u8> {
-        self.rhythm.map(|r| r.step_count())
+        self.pads.get(self.pad_index?).and_then(|p| p.clone().map(|p| p.rhythm.step_count()))
+    }
+
+    pub fn file_names(&self) -> Vec<embedded_sdmmc::ShortFileName> {
+        self.file_names.clone()
     }
 
     fn file_offset(&self) -> Result<u32, Error> {
@@ -290,8 +322,8 @@ impl<'a> Steps<'a> {
                 Event::Sync => {
                     match self.state {
                         State::Desync { inner: Desync::Hold, counter, .. } => {
-                            let i = (self.file_offset()?.saturating_sub(0x2c)) % (self.step_len().await?) < GRAIN_LEN as u32;
-                            defmt::info!("sync: init_seek to {}, i: {}", counter, i);
+                            // let i = (self.file_offset()?.saturating_sub(0x2c)) % (self.step_len()?) < GRAIN_LEN as u32;
+                            // defmt::info!("sync: init_seek to {}, i: {}", counter, i);
                             self.file_seek_from_start(0x2c + counter)?;
 
                             State::Sync
@@ -301,7 +333,7 @@ impl<'a> Steps<'a> {
                             step,
                             counter
                         } => {
-                            defmt::info!("sync: hold step {}", step);
+                            // defmt::info!("sync: hold step {}", step);
 
                             State::Desync { inner: Desync::Hold, step, counter }
                         },
@@ -309,10 +341,10 @@ impl<'a> Steps<'a> {
                     }
                 },
                 Event::Hold { step } => {
-                    defmt::info!("hold: init_seek...");
+                    // defmt::info!("hold: init_seek...");
 
                     let counter = self.file_offset()? - 0x2c;
-                    self.file_seek_from_start(0x2c + self.step_len().await? * step)?;
+                    self.file_seek_from_start(0x2c + self.step_len()? * step)?;
 
                     State::Desync {
                         inner: Desync::Hold,
@@ -325,7 +357,7 @@ impl<'a> Steps<'a> {
                         State::Desync { counter, .. } => counter,
                         _ => self.file_offset()? - 0x2c,
                     };
-                    self.file_seek_from_start(0x2c + self.step_len().await? * step)?;
+                    self.file_seek_from_start(0x2c + self.step_len()? * step)?;
 
                     State::Desync {
                         inner: Desync::Loop { length },
@@ -345,9 +377,9 @@ impl<'a> Steps<'a> {
             matches!(self.event_buf.front(), Some(Event::Sync)) && !self.running ||
             matches!(self.event_buf.front(), Some(Event::Hold {..})) && !self.running ||
             matches!(self.state, State::Desync { inner: Desync::Loop { .. }, .. }) {
-            Ok((self.file_offset()?.saturating_sub(0x2c)) % (self.step_len().await? / 16) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed)) as u32)
+            Ok((self.file_offset()?.saturating_sub(0x2c)) % (self.step_len()? / 16) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed())) as u32)
         } else {
-            Ok((self.file_offset()?.saturating_sub(0x2c)) % (self.step_len().await? / 2) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed)) as u32)
+            Ok((self.file_offset()?.saturating_sub(0x2c)) % (self.step_len()? / 2) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed())) as u32)
         }
     }
 }

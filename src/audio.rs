@@ -144,17 +144,7 @@ impl<'a> Steps<'a> {
 
             if self.file.is_some() {
                 // sync to global tempo
-                self.sync_speed = (1..=16)
-                    .map(|i| {
-                        let raw = self.anchor_tempo / pad.rhythm.tempo();
-                        if raw > 1.0 {
-                            raw / i as f32
-                        } else {
-                            raw * i as f32
-                        }
-                    }).min_by(|&a, &b| {
-                        (1.0 - a).abs().total_cmp(&(1.0 - b).abs())
-                    }).unwrap();
+                self.sync_speed = self.anchor_tempo / pad.rhythm.tempo()
             } else {
                 // anchor global tempo
                 self.anchor_tempo = pad.rhythm.tempo();
@@ -251,9 +241,10 @@ impl<'a> Steps<'a> {
             let millis = now.duration_since(past).as_millis();
 
             if millis > 17 {
-                let speed = self.step_len()? as f32 / (millis as f32 * (SAMPLE_RATE.0 / 1000) as f32);
+                let beat_len = self.step_len()?;
+                let speed = beat_len as f32 / (millis as f32 * (SAMPLE_RATE.0 / 1000) as f32);
                 self.tap_speed = speed;
-                let offset = (self.file_offset()? / self.step_len()?) * self.step_len()? + crate::lock_async_ref!(ANCHOR);
+                let offset = (self.file_offset()? / beat_len) * beat_len + crate::lock_async_ref!(ANCHOR);
                 defmt::info!("offset: {}", offset);
                 self.file_seek_from_start(offset)?;
             }

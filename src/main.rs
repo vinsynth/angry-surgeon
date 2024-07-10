@@ -34,6 +34,8 @@ use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::peripherals::{ADC1, TIM4};
 use embassy_stm32::time::Hertz;
 
+pub const PAD_COUNT: u8 = 8;
+
 type RingBuf<T, const CAP: usize> = arraydeque::ArrayDeque<T, CAP, arraydeque::Wrapping>;
 
 static PWM: SyncMutex<RefCell<Option<InterruptPwm<TIM4>>>> = SyncMutex::new(RefCell::new(None));
@@ -273,35 +275,38 @@ async fn handle_step_sequence() {
     loop {
         let mut downs = MTX.lock().await.borrow().clone();
         let step_count = lock_async_ref!(STEPS).step_count().unwrap_or(0);
-        downs.retain(|&v| v < step_count);
+        downs.retain(|&v| v < PAD_COUNT);
         // process state
         if prev_downs != downs {
-            if let Some(&step) = downs.first() {
-                if downs.len() > 1 {
-                    // init loop start
-                    let numerator = downs
-                        .iter()
-                        .skip(1)
-                        .map(|v| v.checked_sub(step + 1).unwrap_or(v + step_count - 1 - step))
-                        .fold(0u32, |acc, v| acc | 1 << v);
+            match downs.first() {
+                Some(&step) if step < step_count => {
+                    if downs.len() > 1 {
+                        // init loop start
+                        let numerator = downs
+                            .iter()
+                            .skip(1)
+                            .map(|v| v.checked_sub(step + 1).unwrap_or(v + PAD_COUNT - 1 - step))
+                            .fold(0u32, |acc, v| acc | 1 << v);
 
-                    info!("numerator: {}, downs: {}", numerator, Debug2Format(&downs));
-                    let length = utils::Fraction::new(numerator, 16);
+                        info!("numerator: {}, downs: {}", numerator, Debug2Format(&downs));
+                        let length = utils::Fraction::new(numerator, 16);
 
-                    lock_async_mut!(STEPS).buffer(audio::Event::Loop { step: step as u32, length });
-                } else if prev_downs.len() > 1 {
-                    // init loop stop
-                    info!("init loop stop!");
-                    lock_async_mut!(STEPS).buffer(audio::Event::Sync);
-                } else {
-                    // init jump
-                    info!("init jump to {}!", step);
-                    lock_async_mut!(STEPS).buffer(audio::Event::Hold { step: step as u32 });
-                }
-            } else {
-                // init sync
-                info!("init sync!");
-                lock_async_mut!(STEPS).buffer(audio::Event::Sync);
+                        lock_async_mut!(STEPS).buffer(audio::Event::Loop { step: step as u32, length });
+                    } else if prev_downs.len() > 1 {
+                        // init loop stop
+                        info!("init loop stop!");
+                        lock_async_mut!(STEPS).buffer(audio::Event::Sync);
+                    } else {
+                        // init jump
+                        info!("init jump to {}!", step);
+                        lock_async_mut!(STEPS).buffer(audio::Event::Hold { step: step as u32 });
+                    }
+                },
+                _ => {
+                    // init sync
+                        info!("init sync!");
+                        lock_async_mut!(STEPS).buffer(audio::Event::Sync);
+                },
             }
         }
         prev_downs = downs;
@@ -317,6 +322,7 @@ async fn handle_pads(
 ) {
     let mut buf: RingBuf<u16, 16> = RingBuf::new();
     let mut prev_downs = Vec::new();
+    let mut pad_index = None;
     loop {
         if assign_sw.is_low() {
             buf.push_back(lock_async_mut!(ADC).read(&mut select_pin));
@@ -330,21 +336,24 @@ async fn handle_pads(
                         acc + v as f32 * (i + 1) as f32
                     }) / (length * (length + 1) / 2) as f32
             };
-            let names = lock_async_ref!(STEPS).file_names();
-
-            let fs_index = ((names.len()) as f32 * wma / 4095.0) as usize;
+            let file_index = (lock_async_ref!(STEPS).file_count() as f32 * wma / 4095.0) as usize;
 
             let downs = MTX.lock().await.borrow().clone();
             if prev_downs != downs {
-                if let (Some(pad_index), Some(name)) =
-                    (downs.last(), names.get(fs_index).cloned())
-                {
-                    match lock_async_mut!(STEPS).assign_pad(pad_index, name.clone()).await {
-                        Err(audio::Error::SdmmcError(embedded_sdmmc::Error::FileAlreadyOpen)) => (),
-                        Err(e) => defmt::panic!("failed to assign pad: {}", Debug2Format(&e)),
-                        _ => (),
+                if let Some(pad_idx) = pad_index {
+                    if let Some(&step_count) = downs.last() {
+                        let step_count = step_count + 1;
+
+                        match lock_async_mut!(STEPS).assign_pad(&file_index, &pad_idx, &step_count).await {
+                            Err(e) => defmt::panic!("failed to assign pad: {}", Debug2Format(&e)),
+                            Ok(true) => (), // file exhausted
+                            _ => (),
+                        }
+
+                        pad_index = None;
                     }
-                    info!("assigned file {} to pad {}!", Debug2Format(&name), pad_index);
+                } else {
+                    pad_index = downs.last().copied();
                 }
                 prev_downs = downs;
             }
@@ -414,7 +423,11 @@ async fn handle_joystick(
 
 #[embassy_executor::task]
 async fn read(sender: Sender<'static, RawMutex, [u8; GRAIN_LEN], 1>) {
-    let grain = lock_async_mut!(STEPS).read_grain().await.unwrap_or([u8::MAX / 2; GRAIN_LEN]);
+    let grain = match lock_async_mut!(STEPS).read_grain().await {
+        Err(audio::Error::NoFileLoaded) => [u8::MAX / 2; GRAIN_LEN],
+        Err(e) => defmt::panic!("read err: {}", Debug2Format(&e)),
+        Ok(v) => v,
+    };
     sender.send(grain).await;
 }
 

@@ -1,15 +1,17 @@
-use alloc::vec;
-use alloc::vec::Vec;
-
 use crate::{fs, RingBuf};
 use crate::utils::Fraction;
+use crate::AsyncMutex;
 
 use crate::rhythm::RhythmData;
+
+use alloc::vec;
+use alloc::vec::Vec;
 
 use defmt::{Debug2Format, Format};
 use micromath::F32Ext;
 
-use embedded_sdmmc::filesystem::ToShortFileName;
+use embedded_sdmmc::{Mode, RawFile};
+use embedded_sdmmc::filesystem::ShortFileName;
 
 use embassy_stm32::peripherals::{DMA2_CH3, SDIO};
 use embassy_stm32::time::Hertz;
@@ -25,7 +27,9 @@ pub type VolMgr<'a> = embedded_sdmmc::VolumeManager<fs::SdioCard<'a, SDIO, DMA2_
 #[derive(Debug, Format)]
 pub enum Error {
     NoFileLoaded,
-    FilenameError,
+    FileOutOfBounds,
+    PadOutOfBounds,
+    StepOutOfBounds,
     SdmmcError(embedded_sdmmc::Error<embassy_stm32::sdmmc::Error>),
 }
 
@@ -54,10 +58,21 @@ enum State {
     Desync { inner: Desync, step: u32, counter: u32 }
 }
 
+/// audio file with additional information
 #[derive(Debug, Clone)]
-pub struct Wav {
-    name: embedded_sdmmc::ShortFileName,
+struct Wav {
+    name: ShortFileName,
+    file: RawFile,
     rhythm: RhythmData,
+}
+
+/// segment of source Wav
+#[derive(Debug, Clone)]
+struct Cut {
+    src_file: RawFile,
+    src_rhythm: RhythmData,
+    step_offset: u8,
+    step_count: u8,
 }
 
 pub struct Steps<'a> {
@@ -65,11 +80,10 @@ pub struct Steps<'a> {
     event_buf: RingBuf<Event, 2>,
     vol_mgr: VolMgr<'a>,
     root: embedded_sdmmc::RawDirectory,
-    file: Option<embedded_sdmmc::RawFile>,
-    file_names: Vec<embedded_sdmmc::ShortFileName>,
-    pads: [Option<Wav>; 16],
+    files: Vec<Wav>,
+    pads: [Option<Cut>; crate::PAD_COUNT as usize],
     pad_index: Option<usize>,
-    anchor_tempo: f32,
+    anchor_tempo: Option<f32>,
     sync_speed: f32,
     tap_speed: f32,
     speed_mod: Option<f32>,
@@ -81,26 +95,33 @@ impl<'a> Steps<'a> {
     pub async fn new(led: embassy_stm32::gpio::Output<'a>, mut vol_mgr: VolMgr<'a>) -> Result<Self, Error> {
         let volume = vol_mgr.open_raw_volume(embedded_sdmmc::VolumeIdx(0)).await?;
         let root = vol_mgr.open_root_dir(volume)?;
-        let file_names = {
+        let files = {
             let mut file_infos = Vec::new();
             vol_mgr.iterate_dir(root, |x| {
                 file_infos.push((x.name.clone(), x.ctime));
             }).await?;
             file_infos.sort_by_key(|(_, ctime)| *ctime);
-            file_infos.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+
+            let mut files = Vec::new();
+            for name in file_infos.iter().map(|(name, _)| name) {
+                let file = vol_mgr.open_file_in_dir(root, name, Mode::ReadOnly).await?;
+                let rhythm = RhythmData::new(&mut vol_mgr, &file).await?;
+
+                files.push(Wav { name: name.clone(), file, rhythm });
+            }
+            files
         };
-        defmt::info!("files: {}", Debug2Format(&file_names));
+        defmt::info!("files: {}", Debug2Format(&files));
 
         Ok(Self {
             state: State::Sync,
             event_buf: RingBuf::new(),
             vol_mgr,
             root,
-            file: None,
-            file_names,
+            files,
             pads: core::array::from_fn(|_| None),
             pad_index: None,
-            anchor_tempo: 0.0,
+            anchor_tempo: None,
             sync_speed: 1.0,
             tap_speed: 1.0,
             speed_mod: None,
@@ -109,63 +130,73 @@ impl<'a> Steps<'a> {
         })
     }
 
-    pub async fn assign_pad<N: ToShortFileName + Clone>(&mut self, pad_index: &u8, file_name: N) -> Result<(), Error> {
-        defmt::assert!(*pad_index < 16);
+    /// assign `Cut` from file to specified pad
+    ///
+    /// returns `true` if enough `Cut`s have been assigned to represent the whole file
+    pub async fn assign_pad(&mut self, file_index: &usize, pad_index: &u8, step_count: &u8) -> Result<bool, Error> {
+        static REMAINING_STEPS: AsyncMutex<Option<u8>> = AsyncMutex::new(None);
 
-        let name = file_name.to_short_filename().map_err(|_| Error::FilenameError)?;
-        // reuse rhythm from other instance of file, otherwise calculate rhythm
-        let rhythm = if let Some(wav) = self.pads.iter().flatten().find(|p| p.name == name) {
-            wav.rhythm
-        } else {
-            let file = self.vol_mgr.open_file_in_dir(
-                self.root,
-                name.clone(),
-                embedded_sdmmc::Mode::ReadOnly
-            ).await?;
-            let rhythm = RhythmData::new(&mut self.vol_mgr, &file).await?;
-            self.vol_mgr.close_file(file).await?;
-            rhythm
-        };
+        if let Some(file) = self.files.get(*file_index) {
+            if let Some(pad) = self.pads.get_mut(*pad_index as usize) {
+                let mut rem_opt = REMAINING_STEPS.lock().await;
+                let rem = rem_opt.get_or_insert(file.rhythm.step_count());
 
-        if let Some(pad) = self.pads.get_mut(*pad_index as usize) {
-            *pad = Some(Wav { name, rhythm });
+                let step_offset = file.rhythm.step_count() - *rem;
+                // track steps now accounted for
+                *rem = rem.checked_sub(*step_count).ok_or(Error::StepOutOfBounds)?;
+            
+                // assign steps to pad
+                *pad = Some(Cut {
+                    src_file: file.file,
+                    src_rhythm: file.rhythm,
+                    step_offset,
+                    step_count: *step_count
+                });
+
+                defmt::info!("assigned {} steps from file {} to pad {}!",
+                    step_count,
+                    Debug2Format(&file.file),
+                    pad_index,
+                );
+
+                if *rem == 0 {
+                    rem_opt.take();
+
+                    return Ok(true);
+                } else {
+                    return Ok(false);
+                }
+            } else {
+                return Err(Error::PadOutOfBounds);
+            }
         }
 
-        Ok(())
+        REMAINING_STEPS.lock().await.take();
+        Err(Error::FileOutOfBounds)
     }
 
     pub async fn load_pad(&mut self, pad_index: &usize) -> Result<(), Error> {
-        defmt::assert!(*pad_index < 16);
-
-        if let Some(Some(pad)) = self.pads.get(*pad_index) {
-            if let Some(file) = self.file {
-                self.vol_mgr.close_file(file).await?;
-            }
-
-            if self.file.is_some() {
+        if let Some(Some(cut)) = self.pads.get(*pad_index) {
+            if let Some(anchor) = self.anchor_tempo {
                 // sync to global tempo
-                self.sync_speed = self.anchor_tempo / pad.rhythm.tempo()
+                self.sync_speed = anchor / cut.src_rhythm.tempo();
             } else {
                 // anchor global tempo
-                self.anchor_tempo = pad.rhythm.tempo();
+                self.anchor_tempo = Some(cut.src_rhythm.tempo());
                 defmt::info!("anchor tempo: {}", self.anchor_tempo);
             }
-            self.file = Some(self.vol_mgr.open_file_in_dir(
-                self.root,
-                pad.name.clone(),
-                embedded_sdmmc::Mode::ReadOnly
-            ).await?);
 
+            self.pad_index = Some(*pad_index);
 
-            self.file_seek_from_start(0x2c)?;
+            self.cut_seek_from_start(0)?;
+
             self.event_buf = RingBuf::new();
             self.state = State::Sync;
-            self.pad_index = Some(*pad_index);
 
             return Ok(());
         }
 
-        Err(Error::NoFileLoaded)
+        Err(Error::PadOutOfBounds)
     }
 
     pub async fn read_grain(&mut self) -> Result<[u8; GRAIN_LEN], Error> {
@@ -180,14 +211,14 @@ impl<'a> Steps<'a> {
             } = self.state {
                 let start = step * self.step_len()?;
                 let end = u32::from((length + step) * Fraction::from(self.step_len()?));
-                let offset = self.file_offset()? - 0x2c;
+                let offset = self.cut_offset()?;
 
                 if offset > end ||
                     offset < start &&
-                    offset > (start + end) % (self.file_length()? - 0x2c)
+                    offset > (start + end) % self.cut_length()?
                 {
                     defmt::debug!("retrig: init_seek to {}", start);
-                    self.file_seek_from_start(0x2c + start)?;
+                    self.cut_seek_from_start(start)?;
                 }
             }
         }
@@ -197,11 +228,15 @@ impl<'a> Steps<'a> {
         let speed = self.speed();
         let mut buf = vec![0; (GRAIN_LEN as f32 * speed) as usize].into_boxed_slice();
 
-        if let Some(file) = self.file {
-            let bytes = self.vol_mgr.read(file, &mut buf).await;
-            if bytes.is_err() || bytes.as_ref().is_ok_and(|x| *x < buf.len()) {
-                // if reached eof, seek to start and finish read
-                self.file_seek_from_start(0x2c)?;
+        if let Some(Some(cut)) = self.pad_index.and_then(|v| self.pads.get_mut(v)) {
+            let bytes = self.vol_mgr.read(cut.src_file, &mut buf).await;
+
+            if bytes.is_err()
+                || bytes.as_ref().is_ok_and(|x| *x < buf.len())
+                || self.cut_offset()? > self.cut_length()?
+            {
+                // if reached eof or end of cut, seek to cut start and finish read
+                self.cut_seek_from_start(0)?;
                 self.file_read(&mut buf[bytes.unwrap_or(0)..]).await?;
             }
         }
@@ -217,9 +252,9 @@ impl<'a> Steps<'a> {
         }
         
         // sync desync
-        let length = self.file_length()?;
+        let length = self.cut_length()?;
         if let State::Desync { ref mut counter, .. } = self.state {
-            *counter = (*counter + buf.len() as u32) % (length - 0x2c);
+            *counter = (*counter + buf.len() as u32) % length;
         }
 
         Ok(out)
@@ -230,7 +265,7 @@ impl<'a> Steps<'a> {
     }
 
     pub async fn tap(&mut self, past: Option<Instant>, cancel: bool) -> Result<Option<Instant>, Error> {
-        static ANCHOR: crate::AsyncMutex<Option<u32>> = crate::AsyncMutex::new(None);
+        static ANCHOR: AsyncMutex<Option<u32>> = AsyncMutex::new(None);
 
         let now = Instant::now();
         if cancel {
@@ -244,27 +279,31 @@ impl<'a> Steps<'a> {
                 let beat_len = self.step_len()?;
                 let speed = beat_len as f32 / (millis as f32 * (SAMPLE_RATE.0 / 1000) as f32);
                 self.tap_speed = speed;
-                let offset = (self.file_offset()? / beat_len) * beat_len + crate::lock_async_ref!(ANCHOR);
+                let offset = (self.cut_offset()? / beat_len) * beat_len + crate::lock_async_ref!(ANCHOR);
                 defmt::info!("offset: {}", offset);
-                self.file_seek_from_start(offset)?;
+                self.cut_seek_from_start(offset)?;
             }
         } else {
-            ANCHOR.lock().await.replace(self.file_offset()? % self.step_len()?);
+            ANCHOR.lock().await.replace(self.cut_offset()? % self.step_len()?);
         }
         Ok(Some(now))
     }
 
     pub fn set_running(&mut self, running: bool) -> Result<(), Error> {
         self.running = running;
-        self.file_seek_from_start(0x2c)
+        self.cut_seek_from_start(0)
     }
 
     pub fn set_speed_mod(&mut self, speed: Option<f32>) {
         self.speed_mod = speed;
     }
 
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
     pub fn step_len(&self) -> Result<u32, Error> {
-        Ok((self.file_length()? - 0x2c) / self.step_count().ok_or(Error::NoFileLoaded)? as u32)
+        Ok(self.cut_length()? / self.step_count().ok_or(Error::NoFileLoaded)? as u32)
     }
 
     pub fn speed(&self) -> f32 {
@@ -272,37 +311,37 @@ impl<'a> Steps<'a> {
     }
 
     pub fn step_count(&self) -> Option<u8> {
-        self.pads.get(self.pad_index?).and_then(|p| p.clone().map(|p| p.rhythm.step_count()))
+        self.pads.get(self.pad_index?).and_then(|c| c.clone().map(|p| p.step_count))
     }
 
-    pub fn file_names(&self) -> Vec<embedded_sdmmc::ShortFileName> {
-        self.file_names.clone()
-    }
-
-    fn file_offset(&self) -> Result<u32, Error> {
-        if let Some(file) = self.file {
-            return Ok(self.vol_mgr.file_offset(file)?)
+    fn cut_offset(&self) -> Result<u32, Error> {
+        if let Some(Some(cut)) = self.pad_index.and_then(|v| self.pads.get(v)) {
+            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
+            let start = 0x2c + pcm_length * cut.step_offset as u32 / cut.src_rhythm.step_count() as u32;
+            return self.vol_mgr.file_offset(cut.src_file)?.checked_sub(start).ok_or(Error::StepOutOfBounds);
         }
         Err(Error::NoFileLoaded)
     }
 
-    fn file_length(&self) -> Result<u32, Error> {
-        if let Some(file) = self.file {
-            return Ok(self.vol_mgr.file_length(file)?)
+    fn cut_length(&self) -> Result<u32, Error> {
+        if let Some(Some(cut)) = self.pad_index.and_then(|v| self.pads.get(v)) {
+            return Ok((self.vol_mgr.file_length(cut.src_file)? - 0x2c) * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
         }
         Err(Error::NoFileLoaded)
     }
 
-    fn file_seek_from_start(&mut self, offset: u32) -> Result<(), Error> {
-        if let Some(file) = self.file {
-            return Ok(self.vol_mgr.file_seek_from_start(file, offset)?)
+    fn cut_seek_from_start(&mut self, offset: u32) -> Result<(), Error> {
+        if let Some(Some(cut)) = self.pad_index.and_then(|v| self.pads.get(v)) {
+            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
+            let start = 0x2c + pcm_length * cut.step_offset as u32 / cut.src_rhythm.step_count() as u32;
+            return Ok(self.vol_mgr.file_seek_from_start(cut.src_file, start + offset)?);
         }
         Err(Error::NoFileLoaded)
     }
 
     async fn file_read(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
-        if let Some(file) = self.file {
-            return Ok(self.vol_mgr.read(file, buffer).await?)
+        if let Some(Some(file)) = self.pad_index.and_then(|v| self.pads.get(v)) {
+            return Ok(self.vol_mgr.read(file.src_file, buffer).await?);
         }
         Err(Error::NoFileLoaded)
     }
@@ -315,7 +354,7 @@ impl<'a> Steps<'a> {
                         State::Desync { inner: Desync::Hold, counter, .. } => {
                             // let i = (self.file_offset()?.saturating_sub(0x2c)) % (self.step_len()?) < GRAIN_LEN as u32;
                             // defmt::info!("sync: init_seek to {}, i: {}", counter, i);
-                            self.file_seek_from_start(0x2c + counter)?;
+                            self.cut_seek_from_start(counter)?;
 
                             State::Sync
                         },
@@ -334,8 +373,8 @@ impl<'a> Steps<'a> {
                 Event::Hold { step } => {
                     // defmt::info!("hold: init_seek...");
 
-                    let counter = self.file_offset()? - 0x2c;
-                    self.file_seek_from_start(0x2c + self.step_len()? * step)?;
+                    let counter = self.cut_offset()?;
+                    self.cut_seek_from_start(self.step_len()? * step)?;
 
                     State::Desync {
                         inner: Desync::Hold,
@@ -346,9 +385,9 @@ impl<'a> Steps<'a> {
                 Event::Loop { step, length } => {
                     let counter = match self.state {
                         State::Desync { counter, .. } => counter,
-                        _ => self.file_offset()? - 0x2c,
+                        _ => self.cut_offset()?,
                     };
-                    self.file_seek_from_start(0x2c + self.step_len()? * step)?;
+                    self.cut_seek_from_start(self.step_len()? * step)?;
 
                     State::Desync {
                         inner: Desync::Loop { length },
@@ -368,9 +407,9 @@ impl<'a> Steps<'a> {
             matches!(self.event_buf.front(), Some(Event::Sync)) && !self.running ||
             matches!(self.event_buf.front(), Some(Event::Hold {..})) && !self.running ||
             matches!(self.state, State::Desync { inner: Desync::Loop { .. }, .. }) {
-            Ok((self.file_offset()?.saturating_sub(0x2c)) % (self.step_len()? / 16) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed())) as u32)
+            Ok(self.cut_offset()? % (self.step_len()? / 16) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed())) as u32)
         } else {
-            Ok((self.file_offset()?.saturating_sub(0x2c)) % (self.step_len()? / 2) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed())) as u32)
+            Ok(self.cut_offset()? % (self.step_len()? / 2) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed())) as u32)
         }
     }
 }

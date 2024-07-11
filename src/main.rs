@@ -294,17 +294,17 @@ async fn handle_step_sequence() {
                         lock_async_mut!(STEPS).buffer(audio::Event::Loop { step: step as u32, length });
                     } else if prev_downs.len() > 1 {
                         // init loop stop
-                        info!("init loop stop!");
+                        // info!("init loop stop!");
                         lock_async_mut!(STEPS).buffer(audio::Event::Sync);
                     } else {
                         // init jump
-                        info!("init jump to {}!", step);
+                        // info!("init jump to {}!", step);
                         lock_async_mut!(STEPS).buffer(audio::Event::Hold { step: step as u32 });
                     }
                 },
                 _ => {
                     // init sync
-                        info!("init sync!");
+                        // info!("init sync!");
                         lock_async_mut!(STEPS).buffer(audio::Event::Sync);
                 },
             }
@@ -317,14 +317,15 @@ async fn handle_step_sequence() {
 #[embassy_executor::task]
 async fn handle_pads(
     mut select_pin: impl embassy_stm32::adc::AdcPin<ADC1> + 'static,
-    assign_sw: gpio::Input<'static>,
-    load_sw: gpio::Input<'static>,
+    cut_sw: gpio::Input<'static>,
+    seq_sw: gpio::Input<'static>,
 ) {
     let mut buf: RingBuf<u16, 16> = RingBuf::new();
     let mut prev_downs = Vec::new();
-    let mut pad_index = None;
+    let mut cut_index = None;
+    let mut seq = Vec::new();
     loop {
-        if assign_sw.is_low() {
+        if cut_sw.is_low() {
             buf.push_back(lock_async_mut!(ADC).read(&mut select_pin));
 
             let wma = {
@@ -340,37 +341,40 @@ async fn handle_pads(
 
             let downs = MTX.lock().await.borrow().clone();
             if prev_downs != downs {
-                if let Some(pad_idx) = pad_index {
+                // assign steps of file to pad
+                if let Some(cut_idx) = cut_index {
                     if let Some(&step_count) = downs.last() {
                         let step_count = step_count + 1;
 
-                        match lock_async_mut!(STEPS).assign_pad(&file_index, &pad_idx, &step_count).await {
+                        match lock_async_mut!(STEPS).assign_pad(&file_index, &cut_idx, &step_count).await {
                             Err(e) => defmt::panic!("failed to assign pad: {}", Debug2Format(&e)),
                             Ok(true) => (), // file exhausted
                             _ => (),
                         }
 
-                        pad_index = None;
+                        cut_index = None;
                     }
                 } else {
-                    pad_index = downs.last().copied();
+                    cut_index = downs.last().copied();
+                    info!("target cut {}...", cut_index);
                 }
-                prev_downs = downs;
             }
-        } else if load_sw.is_low() {
-            buf.push_back(lock_async_mut!(ADC).read(&mut select_pin));
-
+            prev_downs = downs;
+        } else if seq_sw.is_low() {
             let downs = MTX.lock().await.borrow().clone();
             if prev_downs != downs {
-                if let Some(pad_index) = downs.last() {
-                    match lock_async_mut!(STEPS).load_pad(&(*pad_index as usize)).await {
-                        Err(audio::Error::NoFileLoaded) => (),
-                        Err(e) => defmt::panic!("failed to load pad: {}", Debug2Format(&e)),
-                        _ => info!("loaded pad {}!", pad_index)
-                    }
+                // build sequence
+                if let Some(pad_idx) = downs.last().copied() {
+                    seq.push(pad_idx);
+                    info!("add cut {} to sequence...", pad_idx);
                 }
-                prev_downs = downs;
             }
+            prev_downs = downs;
+        } else if !seq.is_empty() {
+            // load sequence
+            info!("init load!");
+            lock_async_mut!(STEPS).buffer(audio::Event::Load { cuts: seq });
+            seq = Vec::new();
         }
 
         Timer::after_millis(1).await;

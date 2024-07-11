@@ -1,4 +1,4 @@
-use crate::{fs, RingBuf};
+use crate::fs;
 use crate::utils::Fraction;
 use crate::AsyncMutex;
 
@@ -8,6 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use defmt::{Debug2Format, Format};
+use itertools::Itertools;
 use micromath::F32Ext;
 
 use embedded_sdmmc::{Mode, RawFile};
@@ -39,11 +40,12 @@ impl From<embedded_sdmmc::Error<embassy_stm32::sdmmc::Error>> for Error {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Format)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     Sync,
     Hold { step: u32 },
     Loop { step: u32, length: Fraction },
+    Load { cuts: Vec<u8> },
 }
 
 #[derive(Debug, PartialEq, Eq, Format)]
@@ -55,7 +57,7 @@ enum Desync {
 #[derive(Debug, PartialEq, Eq, Format)]
 enum State {
     Sync,
-    Desync { inner: Desync, step: u32, counter: u32 }
+    Desync { inner: Desync, step: u32, index: usize, counter: u32 }
 }
 
 /// audio file with additional information
@@ -77,12 +79,12 @@ struct Cut {
 
 pub struct Steps<'a> {
     state: State,
-    event_buf: RingBuf<Event, 2>,
+    event_buf: Option<Event>,
     vol_mgr: VolMgr<'a>,
-    root: embedded_sdmmc::RawDirectory,
     files: Vec<Wav>,
-    pads: [Option<Cut>; crate::PAD_COUNT as usize],
-    pad_index: Option<usize>,
+    cuts: [Option<Cut>; crate::PAD_COUNT as usize],
+    seq: Vec<u8>,
+    seq_index: Option<usize>,
     anchor_tempo: Option<f32>,
     sync_speed: f32,
     tap_speed: f32,
@@ -115,12 +117,12 @@ impl<'a> Steps<'a> {
 
         Ok(Self {
             state: State::Sync,
-            event_buf: RingBuf::new(),
+            event_buf: None,
             vol_mgr,
-            root,
             files,
-            pads: core::array::from_fn(|_| None),
-            pad_index: None,
+            cuts: core::array::from_fn(|_| None),
+            seq: Vec::new(),
+            seq_index: None,
             anchor_tempo: None,
             sync_speed: 1.0,
             tap_speed: 1.0,
@@ -134,12 +136,16 @@ impl<'a> Steps<'a> {
     ///
     /// returns `true` if enough `Cut`s have been assigned to represent the whole file
     pub async fn assign_pad(&mut self, file_index: &usize, pad_index: &u8, step_count: &u8) -> Result<bool, Error> {
-        static REMAINING_STEPS: AsyncMutex<Option<u8>> = AsyncMutex::new(None);
+        // remaining steps in file to be assigned
+        static REM_4_FILE: AsyncMutex<Option<(u8, usize)>> = AsyncMutex::new(None);
 
         if let Some(file) = self.files.get(*file_index) {
-            if let Some(pad) = self.pads.get_mut(*pad_index as usize) {
-                let mut rem_opt = REMAINING_STEPS.lock().await;
-                let rem = rem_opt.get_or_insert(file.rhythm.step_count());
+            if let Some(pad) = self.cuts.get_mut(*pad_index as usize) {
+                let mut rem_opt = REM_4_FILE.lock().await;
+                if rem_opt.is_some_and(|(_, i)| i != *file_index) {
+                    *rem_opt = Some((file.rhythm.step_count(), *file_index));
+                }
+                let (rem, _) = rem_opt.get_or_insert((file.rhythm.step_count(), *file_index));
 
                 let step_offset = file.rhythm.step_count() - *rem;
                 // track steps now accounted for
@@ -163,40 +169,14 @@ impl<'a> Steps<'a> {
                     rem_opt.take();
 
                     return Ok(true);
-                } else {
-                    return Ok(false);
                 }
-            } else {
-                return Err(Error::PadOutOfBounds);
+                return Ok(false);
             }
+            return Err(Error::PadOutOfBounds);
         }
 
-        REMAINING_STEPS.lock().await.take();
+        REM_4_FILE.lock().await.take();
         Err(Error::FileOutOfBounds)
-    }
-
-    pub async fn load_pad(&mut self, pad_index: &usize) -> Result<(), Error> {
-        if let Some(Some(cut)) = self.pads.get(*pad_index) {
-            if let Some(anchor) = self.anchor_tempo {
-                // sync to global tempo
-                self.sync_speed = anchor / cut.src_rhythm.tempo();
-            } else {
-                // anchor global tempo
-                self.anchor_tempo = Some(cut.src_rhythm.tempo());
-                defmt::info!("anchor tempo: {}", self.anchor_tempo);
-            }
-
-            self.pad_index = Some(*pad_index);
-
-            self.cut_seek_from_start(0)?;
-
-            self.event_buf = RingBuf::new();
-            self.state = State::Sync;
-
-            return Ok(());
-        }
-
-        Err(Error::PadOutOfBounds)
     }
 
     pub async fn read_grain(&mut self) -> Result<[u8; GRAIN_LEN], Error> {
@@ -207,18 +187,21 @@ impl<'a> Steps<'a> {
 
             // retrig
             if let State::Desync {
-                inner: Desync::Loop { length }, step, ..
+                inner: Desync::Loop { length }, step, index, ..
             } = self.state {
-                let start = step * self.step_len()?;
-                let end = u32::from((length + step) * Fraction::from(self.step_len()?));
-                let offset = self.cut_offset()?;
+                if let Some(curr_idx) = self.seq_index.and_then(|i| self.seq.get(i)) {
+                    let start = self.seq_length_until_index(index)? + step * self.step_len()?;
+                    let end = self.seq_length_until_index(index)? + u32::from((length + step) * Fraction::from(self.step_len()?));
+                    let offset = self.seq_length_until_index(*curr_idx as usize)? + self.cut_offset()?;
 
-                if offset > end ||
-                    offset < start &&
-                    offset > (start + end) % self.cut_length()?
-                {
-                    defmt::debug!("retrig: init_seek to {}", start);
-                    self.cut_seek_from_start(start)?;
+                    if offset > end
+                        || offset < start
+                        && offset > (start + end) % self.cut_length()?
+                    {
+                        defmt::debug!("retrig: init_seek to {}", start);
+                        self.load_seq_index(index).await?;
+                        self.cut_seek_from_start(step * self.step_len()?)?;
+                    }
                 }
             }
         }
@@ -228,16 +211,17 @@ impl<'a> Steps<'a> {
         let speed = self.speed();
         let mut buf = vec![0; (GRAIN_LEN as f32 * speed) as usize].into_boxed_slice();
 
-        if let Some(Some(cut)) = self.pad_index.and_then(|v| self.pads.get_mut(v)) {
-            let bytes = self.vol_mgr.read(cut.src_file, &mut buf).await;
-
-            if bytes.is_err()
+        if let Some(idx) = self.seq_index {
+            let mut bytes = self.read_file(&mut buf).await;
+            // read cut(s) until buffer full
+            while bytes.is_err()
                 || bytes.as_ref().is_ok_and(|x| *x < buf.len())
                 || self.cut_offset()? > self.cut_length()?
             {
-                // if reached eof or end of cut, seek to cut start and finish read
-                self.cut_seek_from_start(0)?;
-                self.file_read(&mut buf[bytes.unwrap_or(0)..]).await?;
+                let idx = (idx + 1).checked_rem(self.seq.len()).ok_or(Error::NoFileLoaded)?;
+                self.load_seq_index(idx).await?;
+
+                bytes = self.read_file(&mut buf).await;
             }
         }
 
@@ -252,16 +236,46 @@ impl<'a> Steps<'a> {
         }
         
         // sync desync
-        let length = self.cut_length()?;
+        let length = self.seq_length_until_index(self.seq.len())?;
         if let State::Desync { ref mut counter, .. } = self.state {
-            *counter = (*counter + buf.len() as u32) % length;
+            // convert desync counter to seq_index
+            let seq_index = (0..self.seq.len())
+                .try_fold(None, |res, idx| -> Result<Option<usize>, Error> {
+                    match res {
+                        None => {
+                            let cut_end = {
+                                let seq_index = idx + 1;
+                                self.seq[..seq_index]
+                                    .iter()
+                                    .try_fold(0, |acc, i| {
+                                        if let Some(Some(cut)) = self.cuts.get(*i as usize) {
+                                            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
+                                            return Ok(acc + pcm_length * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
+                                        }
+                                        Err(Error::PadOutOfBounds)
+                                    })
+                            }?;
+                            if cut_end > *counter {
+                                return Ok(Some(idx));
+                            }
+                            Ok(None)
+                        },
+                        opt => Ok(opt),
+                    }
+                })?.ok_or(Error::NoFileLoaded)?;
+            // add len of theoretical sync buffer to counter
+            if let Some(Some(cut)) = self.seq.get(seq_index).and_then(|i| self.cuts.get(*i as usize)) {
+                if let Some(anchor) = self.anchor_tempo {
+                    let sync_speed = anchor / cut.src_rhythm.tempo();
+                    let buf_len = GRAIN_LEN as f32 * sync_speed * self.tap_speed * self.speed_mod.unwrap_or(1.0);
+                    *counter = (*counter + buf_len as u32) % length;
+                }
+            } else {
+                return Err(Error::NoFileLoaded);
+            }
         }
 
         Ok(out)
-    }
-
-    pub fn buffer(&mut self, event: Event) {
-        self.event_buf.push_back(event);
     }
 
     pub async fn tap(&mut self, past: Option<Instant>, cancel: bool) -> Result<Option<Instant>, Error> {
@@ -289,6 +303,10 @@ impl<'a> Steps<'a> {
         Ok(Some(now))
     }
 
+    pub fn buffer(&mut self, event: Event) {
+        self.event_buf = Some(event);
+    }
+
     pub fn set_running(&mut self, running: bool) -> Result<(), Error> {
         self.running = running;
         self.cut_seek_from_start(0)
@@ -302,90 +320,91 @@ impl<'a> Steps<'a> {
         self.files.len()
     }
 
+    pub fn step_count(&self) -> Result<u8, Error> {
+        if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
+            return Ok(cut.step_count);
+        }
+        Err(Error::NoFileLoaded)
+    }
+
     pub fn step_len(&self) -> Result<u32, Error> {
-        Ok(self.cut_length()? / self.step_count().ok_or(Error::NoFileLoaded)? as u32)
+        if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
+            return Ok(self.cut_length()? / cut.step_count as u32);
+        }
+        Err(Error::NoFileLoaded)
     }
 
     pub fn speed(&self) -> f32 {
         self.sync_speed * self.tap_speed * self.speed_mod.unwrap_or(1.0)
     }
 
-    pub fn step_count(&self) -> Option<u8> {
-        self.pads.get(self.pad_index?).and_then(|c| c.clone().map(|p| p.step_count))
-    }
+    async fn load_seq_index(&mut self, index: usize) -> Result<(), Error> {
+        if let Some(Some(cut)) = self.seq.get(index).and_then(|i| self.cuts.get(*i as usize)) {
+            if let Some(anchor) = self.anchor_tempo {
+                // sync to global tempo
+                self.sync_speed = anchor / cut.src_rhythm.tempo();
+            } else {
+                // anchor global tempo
+                self.anchor_tempo = Some(cut.src_rhythm.tempo());
+                defmt::info!("anchor tempo: {}", self.anchor_tempo);
+            }
 
-    fn cut_offset(&self) -> Result<u32, Error> {
-        if let Some(Some(cut)) = self.pad_index.and_then(|v| self.pads.get(v)) {
-            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
-            let start = 0x2c + pcm_length * cut.step_offset as u32 / cut.src_rhythm.step_count() as u32;
-            return self.vol_mgr.file_offset(cut.src_file)?.checked_sub(start).ok_or(Error::StepOutOfBounds);
+            self.seq_index = Some(index);
+            self.cut_seek_from_start(0)?;
+
+            return Ok(());
         }
-        Err(Error::NoFileLoaded)
+        Err(Error::PadOutOfBounds)
     }
 
-    fn cut_length(&self) -> Result<u32, Error> {
-        if let Some(Some(cut)) = self.pad_index.and_then(|v| self.pads.get(v)) {
-            return Ok((self.vol_mgr.file_length(cut.src_file)? - 0x2c) * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
-        }
-        Err(Error::NoFileLoaded)
-    }
-
-    fn cut_seek_from_start(&mut self, offset: u32) -> Result<(), Error> {
-        if let Some(Some(cut)) = self.pad_index.and_then(|v| self.pads.get(v)) {
-            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
-            let start = 0x2c + pcm_length * cut.step_offset as u32 / cut.src_rhythm.step_count() as u32;
-            return Ok(self.vol_mgr.file_seek_from_start(cut.src_file, start + offset)?);
-        }
-        Err(Error::NoFileLoaded)
-    }
-
-    async fn file_read(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
-        if let Some(Some(file)) = self.pad_index.and_then(|v| self.pads.get(v)) {
-            return Ok(self.vol_mgr.read(file.src_file, buffer).await?);
+    async fn read_file(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
+        if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
+            return Ok(self.vol_mgr.read(cut.src_file, buffer).await?);
         }
         Err(Error::NoFileLoaded)
     }
 
     async fn update(&mut self) -> Result<(), Error> {
-        if let Some(event) = self.event_buf.front() {
-            self.state = match *event {
-                Event::Sync => {
-                    match self.state {
-                        State::Desync { inner: Desync::Hold, counter, .. } => {
-                            // let i = (self.file_offset()?.saturating_sub(0x2c)) % (self.step_len()?) < GRAIN_LEN as u32;
-                            // defmt::info!("sync: init_seek to {}, i: {}", counter, i);
-                            self.cut_seek_from_start(counter)?;
+        if let Some(event) = self.event_buf.as_ref() {
+            self.state = match event {
+                &Event::Sync => {
+                    if let State::Desync { counter, .. } = self.state {
+                        let seq_index = self.counter_to_seq_index(counter)?;
+                        let cut_start = self.seq_length_until_index(seq_index)?;
 
-                            State::Sync
-                        },
-                        State::Desync {
-                            inner: Desync::Loop { .. },
-                            step,
-                            counter
-                        } => {
-                            // defmt::info!("sync: hold step {}", step);
-
-                            State::Desync { inner: Desync::Hold, step, counter }
-                        },
-                        _ => State::Sync
+                        self.load_seq_index(seq_index).await?;
+                        self.cut_seek_from_start(counter - cut_start)?;
+                        defmt::info!("sync to {} (index {})!", counter, seq_index);
                     }
+                    State::Sync
                 },
-                Event::Hold { step } => {
-                    // defmt::info!("hold: init_seek...");
-
-                    let counter = self.cut_offset()?;
-                    self.cut_seek_from_start(self.step_len()? * step)?;
+                &Event::Hold { step } => {
+                    let (counter, index) = match self.state {
+                        State::Desync { inner: Desync::Loop { .. }, counter, index, .. } => (counter, index),
+                        _ => {
+                            let index = self.seq_index.ok_or(Error::NoFileLoaded)?;
+                            let counter = self.seq_length_until_index(index)? + self.cut_offset()?;
+                            self.cut_seek_from_start(self.step_len()? * step)?;
+                            (counter, index)
+                        },
+                    };
+                    defmt::info!("hold from {}!", counter);
 
                     State::Desync {
                         inner: Desync::Hold,
                         step,
                         counter,
+                        index,
                     }
                 },
-                Event::Loop { step, length } => {
-                    let counter = match self.state {
-                        State::Desync { counter, .. } => counter,
-                        _ => self.cut_offset()?,
+                &Event::Loop { step, length } => {
+                    let (counter, index) = match self.state {
+                        State::Desync { counter, index, .. } => (counter, index),
+                        _ => {
+                            let index = self.seq_index.ok_or(Error::NoFileLoaded)?;
+                            let counter = self.seq_length_until_index(index)? + self.cut_offset()?;
+                            (counter, index)
+                        },
                     };
                     self.cut_seek_from_start(self.step_len()? * step)?;
 
@@ -393,23 +412,95 @@ impl<'a> Steps<'a> {
                         inner: Desync::Loop { length },
                         step,
                         counter,
+                        index,
                     }
                 },
+                Event::Load { cuts } => {
+                    if !cuts.iter().all(|&v| self.cuts.len() > v as usize) {
+                        return Err(Error::PadOutOfBounds);
+                    }
+                    self.seq.clone_from(cuts);
+                    let info_cuts = cuts.clone();
+                    self.load_seq_index(0).await?;
+                    self.cut_seek_from_start(0)?;
+                    defmt::info!("loaded sequence {}!", Debug2Format(&info_cuts));
+
+                    State::Sync
+                },
             };
-            self.event_buf.pop_front();
+            self.event_buf.take();
         }
 
         Ok(())
     }
 
     async fn is_quantum(&self) -> Result<bool, Error> {
-        if matches!(self.event_buf.front(), Some(Event::Loop { .. })) ||
-            matches!(self.event_buf.front(), Some(Event::Sync)) && !self.running ||
-            matches!(self.event_buf.front(), Some(Event::Hold {..})) && !self.running ||
-            matches!(self.state, State::Desync { inner: Desync::Loop { .. }, .. }) {
-            Ok(self.cut_offset()? % (self.step_len()? / 16) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed())) as u32)
-        } else {
-            Ok(self.cut_offset()? % (self.step_len()? / 2) < (GRAIN_LEN as f32 * self.speed_mod.unwrap_or(self.speed())) as u32)
+        if self.seq_index.is_none() {
+            return Ok(true);
         }
+        if matches!(self.event_buf, Some(Event::Loop { .. }))
+            || matches!(self.event_buf, Some(Event::Sync)) && !self.running
+            || matches!(self.event_buf, Some(Event::Hold {..})) && !self.running
+            || matches!(self.state, State::Desync { inner: Desync::Loop { .. }, .. })
+        {
+            return Ok(self.cut_offset()? % (self.step_len()? / 16) < (GRAIN_LEN as f32 * self.speed()) as u32)
+        }
+        Ok(self.cut_offset()? % (self.step_len()? / 2) < (GRAIN_LEN as f32 * self.speed()) as u32)
+    }
+
+    /// convert desync counter to seq_index
+    fn counter_to_seq_index(&self, counter: u32) -> Result<usize, Error> {
+        (0..self.seq.len())
+            .try_fold(None, |res, idx| -> Result<Option<usize>, Error> {
+                match res {
+                    None => {
+                        let cut_end = self.seq_length_until_index(idx + 1)?;
+                        if cut_end > counter {
+                            return Ok(Some(idx));
+                        }
+                        Ok(None)
+                    },
+                    opt => Ok(opt),
+                }
+            })?.ok_or(Error::NoFileLoaded)
+    }
+
+    fn cut_length(&self) -> Result<u32, Error> {
+        if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
+            return Ok((self.vol_mgr.file_length(cut.src_file)? - 0x2c) * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
+        }
+        Err(Error::NoFileLoaded)
+    }
+
+    fn seq_length_until_index(&self, seq_index: usize) -> Result<u32, Error> {
+        self.seq[..seq_index]
+            .iter()
+            .try_fold(0, |acc, i| {
+                if let Some(Some(cut)) = self.cuts.get(*i as usize) {
+                    let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
+                    return Ok(acc + pcm_length * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
+                }
+                Err(Error::PadOutOfBounds)
+            })
+    }
+
+    fn cut_offset(&self) -> Result<u32, Error> {
+        if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
+            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
+            let start = 0x2c + pcm_length * cut.step_offset as u32 / cut.src_rhythm.step_count() as u32;
+            return self.vol_mgr.file_offset(cut.src_file)?.checked_sub(start).ok_or(Error::StepOutOfBounds);
+        }
+        Err(Error::NoFileLoaded)
+    }
+
+    fn cut_seek_from_start(&mut self, offset: u32) -> Result<(), Error> {
+        if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
+            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
+            defmt::info!("offset: {}", offset);
+            defmt::info!("length: {}", pcm_length);
+            let start = 0x2c + pcm_length * cut.step_offset as u32 / cut.src_rhythm.step_count() as u32;
+            return Ok(self.vol_mgr.file_seek_from_start(cut.src_file, start + offset)?);
+        }
+        Err(Error::NoFileLoaded)
     }
 }

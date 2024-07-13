@@ -67,7 +67,7 @@ impl RhythmData {
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| (i as u8 + 1) / 2)
+            .map(|(i, _)| i as u8 + 1)
             .unwrap();
 
         let tempo = step_count as f32 /

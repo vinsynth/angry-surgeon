@@ -6,6 +6,7 @@ use crate::rhythm::RhythmData;
 
 use alloc::vec;
 use alloc::vec::Vec;
+use alloc::boxed::Box;
 
 use defmt::{Debug2Format, Format};
 use micromath::F32Ext;
@@ -15,11 +16,9 @@ use embedded_sdmmc::filesystem::ShortFileName;
 
 use embassy_stm32::peripherals::{DMA2_CH3, SDIO};
 use embassy_stm32::time::Hertz;
-use embassy_time::Instant;
 
 // import end ------------------------------------------------------------------
 
-pub const GRAIN_LEN: usize = 256;
 pub const SAMPLE_RATE: Hertz = Hertz::khz(32);
 
 pub type VolMgr<'a> = embedded_sdmmc::VolumeManager<fs::SdioCard<'a, SDIO, DMA2_CH3>, fs::DummyTimesource, 4, 4, 1>;
@@ -190,36 +189,22 @@ impl<'a> Steps<'a> {
         Ok(true)
     }
 
-    pub async fn tap(&mut self, past: Option<Instant>, cancel: bool) -> Result<Option<Instant>, Error> {
-        if !self.is_file_loaded() {
-            return Err(Error::NoFileLoaded);
-        }
-        // relative offset [0..1] within step
-        static ANCHOR: AsyncMutex<Option<f32>> = AsyncMutex::new(None);
-
-        let now = Instant::now();
-        if cancel {
-            *ANCHOR.lock().await = None;
-            return Ok(None)
-        }
-        if let Some(past) = past {
-            let millis = now.duration_since(past).as_millis();
-
-            if millis > 17 {
-                let speed = self.step_len()? as f32 / (millis as f32 * (SAMPLE_RATE.0 / 1000) as f32);
-                self.tap_speed = speed;
-                let offset = (*crate::lock_async_ref!(ANCHOR) * self.step_len()? as f32) as u32
-                    + (self.cut_offset()? - self.cut_offset()? % self.step_len()?);
-                defmt::info!("offset: {}", offset);
-                self.cut_seek_from_start(offset)?;
+    pub fn set_clock_in_tempo(&mut self, tempo: f32) -> Result<(), Error> {
+        if let Some(anchor) = self.anchor_tempo {
+            if (anchor / tempo).is_normal() {
+                self.tap_speed = tempo * 2.0 / anchor;
+                defmt::info!("anchor: {} | tempo: {} | tap_speed: {}",
+                    anchor,
+                    tempo,
+                    self.tap_speed
+                );
             }
-        } else {
-            ANCHOR.lock().await.replace((self.cut_offset()?  as f32 / self.step_len()? as f32).fract());
-        }
-        Ok(Some(now))
+            return Ok(());
+        };
+        Err(Error::NoFileLoaded)
     }
 
-    pub async fn read_grain(&mut self) -> Result<[u8; GRAIN_LEN], Error> {
+    pub async fn read_grain(&mut self) -> Result<Box<[u8]>,  Error> {
         // handle state
         if self.is_quantum().await? {
             self.update().await?;
@@ -229,10 +214,10 @@ impl<'a> Steps<'a> {
             if let State::Desync {
                 inner: Desync::Loop { length }, step, index, ..
             } = self.state {
-                if let Some(curr_idx) = self.seq_index.and_then(|i| self.seq.get(i)) {
+                if let Some(curr_idx) = self.seq_index {
                     let start = self.seq_length_until_index(index)? + step * self.step_len()?;
                     let end = self.seq_length_until_index(index)? + u32::from((length + step) * Fraction::from(self.step_len()?));
-                    let offset = self.seq_length_until_index(*curr_idx as usize)? + self.cut_offset()?;
+                    let offset = self.seq_length_until_index(curr_idx)? + self.cut_offset()?;
 
                     if offset > end
                         || offset < start
@@ -245,9 +230,9 @@ impl<'a> Steps<'a> {
             }
         }
 
-        let mut out = [u8::MAX / 2; GRAIN_LEN];
+        let mut out = vec![u8::MAX / 2; self.grain_len()?].into_boxed_slice();
         let speed = self.speed();
-        let mut buf = vec![0; (GRAIN_LEN as f32 * speed) as usize].into_boxed_slice();
+        let mut buf = vec![u8::MAX / 2; (self.grain_len()? as f32 * speed) as usize].into_boxed_slice();
 
         // read cut(s) until buffer full
         let mut bytes = self.read_file(&mut buf).await;
@@ -272,6 +257,7 @@ impl<'a> Steps<'a> {
         
         // sync desync
         let length = self.seq_length_until_index(self.seq.len())?;
+        let grain_len = self.grain_len()?;
         if let State::Desync { ref mut counter, .. } = self.state {
             // convert desync counter to seq_index
             let seq_index = (0..self.seq.len())
@@ -302,7 +288,7 @@ impl<'a> Steps<'a> {
             if let Some(Some(cut)) = self.seq.get(seq_index).and_then(|i| self.cuts.get(*i as usize)) {
                 if let Some(anchor) = self.anchor_tempo {
                     let sync_speed = anchor / cut.src_rhythm.tempo();
-                    let buf_len = GRAIN_LEN as f32 * sync_speed * self.tap_speed * self.speed_mod.unwrap_or(1.0);
+                    let buf_len = grain_len as f32 * sync_speed * self.tap_speed * self.speed_mod.unwrap_or(1.0);
                     *counter = (*counter + buf_len as u32).checked_rem(length).unwrap_or(*counter + buf_len as u32);
                 }
             } else {
@@ -317,6 +303,7 @@ impl<'a> Steps<'a> {
             return Err(Error::NoFileLoaded);
         }
         self.event_buf = Some(event);
+        defmt::info!("event: {}", Debug2Format(&self.event_buf));
         Ok(())
     }
 
@@ -357,7 +344,6 @@ impl<'a> Steps<'a> {
             for addend in  1..=self.seq.len() {
                 let i = (init + addend) % self.seq.len();
                 if self.seq.get(i).is_some_and(|i| self.cuts.get(*i as usize).is_some_and(|c| c.is_some())) {
-                    defmt::info!("skipping to step {}!", i);
                     self.load_seq_index(i).await?;
 
                     return Ok(());
@@ -372,7 +358,6 @@ impl<'a> Steps<'a> {
             return Err(Error::PadOutOfBounds);
         }
         self.seq_index = Some(index);
-        defmt::info!("self.seq_index: {}", self.seq_index);
         if let Some(Some(cut)) = self.seq.get(index).and_then(|i| self.cuts.get(*i as usize)) {
             if let Some(anchor) = self.anchor_tempo {
                 // sync to global tempo
@@ -479,9 +464,9 @@ impl<'a> Steps<'a> {
             || matches!(self.event_buf, Some(Event::Hold {..})) && !self.running
             || matches!(self.state, State::Desync { inner: Desync::Loop { .. }, .. })
         {
-            return Ok(self.cut_offset()? % (self.step_len()? / 16) < (GRAIN_LEN as f32 * self.speed()) as u32)
+            return Ok(self.cut_offset()? % (self.step_len()? / 16) < (self.grain_len()? as f32 * self.speed()) as u32)
         }
-        Ok(self.cut_offset()? % (self.step_len()? / 2) < (GRAIN_LEN as f32 * self.speed()) as u32)
+        Ok(self.cut_offset()? % (self.step_len()? / 2) < (self.grain_len()? as f32 * self.speed()) as u32)
     }
 
     /// convert desync counter to seq_index
@@ -501,6 +486,10 @@ impl<'a> Steps<'a> {
             })?.ok_or(Error::NoFileLoaded)
     }
 
+    fn grain_len(&self) -> Result<usize, Error> {
+        Ok(self.step_len()? as usize / 16)
+    }
+
     fn cut_length(&self) -> Result<u32, Error> {
         if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
             return Ok((self.vol_mgr.file_length(cut.src_file)? - 0x2c) * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
@@ -512,7 +501,7 @@ impl<'a> Steps<'a> {
         if seq_index >= self.cuts.len()  {
             return Err(Error::PadOutOfBounds);
         }
-        self.seq[..seq_index]
+        let ret = self.seq[..seq_index]
             .iter()
             .try_fold(0, |acc, i| {
                 if let Some(Some(cut)) = self.cuts.get(*i as usize) {
@@ -520,7 +509,8 @@ impl<'a> Steps<'a> {
                     return Ok(acc + pcm_length * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
                 }
                 Ok(acc)
-            })
+            });
+        ret
     }
 
     fn cut_offset(&self) -> Result<u32, Error> {

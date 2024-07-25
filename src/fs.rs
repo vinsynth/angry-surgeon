@@ -3,10 +3,19 @@ use core::result::Result;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 
+use embassy_stm32::peripherals::{DMA2_CH3, SDIO};
 use embassy_stm32::sdmmc::{DataBlock, Instance, Sdmmc, SdmmcDma};
 use embassy_stm32::sdmmc::Error as SdmmcError;
 
 use embedded_sdmmc::{Block, BlockDevice, BlockIdx, Timestamp, BlockCount};
+
+pub type VolMgr<'a> = embedded_sdmmc::VolumeManager<
+    SdioCard<'a, SDIO, DMA2_CH3>,
+    DummyTimesource,
+    1,
+    {crate::PAD_COUNT as usize + 1},
+    1,
+>;
 
 pub struct SdioCard<'a, T: Instance, D: SdmmcDma<T>> {
     inner: Mutex<CriticalSectionRawMutex, SdioCardInner<'a, T, D>>

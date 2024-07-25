@@ -1,6 +1,6 @@
 use crate::audio::SAMPLE_RATE;
+use crate::audio::VolMgr;
 use crate::audio::Error;
-use crate::fs::VolMgr;
 
 use defmt::*;
 

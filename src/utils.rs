@@ -5,7 +5,7 @@ macro_rules! expect {
     ( $result:expr, $message:expr ) => {
         match $result {
             Ok(v) => v,
-            Err(e) => defmt::panic!("{}: {}", $message, defmt::Debug2Format(&e))
+            Err(e) => defmt::panic!("{}: {}", $message, Debug2Format(&e))
         }
     }
 }

@@ -1,19 +1,42 @@
-use crate::fs::VolMgr;
+use crate::fs;
 use crate::utils::Fraction;
 use crate::AsyncMutex;
 
-use super::Error;
-use super::Wav;
-use super::rhythm::RhythmData;
+use crate::rhythm::RhythmData;
 
-use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use alloc::boxed::Box;
 
 use defmt::{Debug2Format, Format};
 use micromath::F32Ext;
 
-use embedded_sdmmc::{Mode,  RawFile};
+use embedded_sdmmc::{Mode, RawFile};
+use embedded_sdmmc::filesystem::ShortFileName;
+
+use embassy_stm32::peripherals::{DMA2_CH3, SDIO};
+use embassy_stm32::time::Hertz;
+
+// import end ------------------------------------------------------------------
+
+pub const SAMPLE_RATE: Hertz = Hertz::khz(32);
+
+pub type VolMgr<'a> = embedded_sdmmc::VolumeManager<fs::SdioCard<'a, SDIO, DMA2_CH3>, fs::DummyTimesource, 4, 4, 1>;
+
+#[derive(Debug, Format)]
+pub enum Error {
+    NoFileLoaded,
+    FileOutOfBounds,
+    PadOutOfBounds,
+    StepOutOfBounds,
+    SdmmcError(embedded_sdmmc::Error<embassy_stm32::sdmmc::Error>),
+}
+
+impl From<embedded_sdmmc::Error<embassy_stm32::sdmmc::Error>> for Error {
+    fn from(value: embedded_sdmmc::Error<embassy_stm32::sdmmc::Error>) -> Self {
+        Self::SdmmcError(value)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
@@ -35,6 +58,14 @@ enum State {
     Desync { inner: Desync, step: u32, index: usize, counter: u32 }
 }
 
+/// audio file with additional information
+#[derive(Debug, Clone)]
+struct Wav {
+    name: ShortFileName,
+    file: RawFile,
+    rhythm: RhythmData,
+}
+
 /// segment of source Wav
 #[derive(Debug, Clone)]
 struct Cut {
@@ -47,6 +78,7 @@ struct Cut {
 pub struct Steps<'a> {
     state: State,
     event_buf: Option<Event>,
+    vol_mgr: VolMgr<'a>,
     files: Vec<Wav>,
     cuts: [Option<Cut>; crate::PAD_COUNT as usize],
     seq: Vec<u8>,
@@ -60,22 +92,20 @@ pub struct Steps<'a> {
 }
 
 impl<'a> Steps<'a> {
-    pub async fn new(vol_mgr: &mut VolMgr<'_>, root: &embedded_sdmmc::RawDirectory, led: embassy_stm32::gpio::Output<'a>) -> Result<Self, Error> {
+    pub async fn new(led: embassy_stm32::gpio::Output<'a>, mut vol_mgr: VolMgr<'a>) -> Result<Self, Error> {
+        let volume = vol_mgr.open_raw_volume(embedded_sdmmc::VolumeIdx(0)).await?;
+        let root = vol_mgr.open_root_dir(volume)?;
         let files = {
             let mut file_infos = Vec::new();
-            vol_mgr.iterate_dir(*root, |x| {
-                if x.name.extension() == "WAV".as_bytes()
-                    || x.name.extension() == "wav".as_bytes()
-                {
-                    file_infos.push((x.name.clone(), x.ctime));
-                }
+            vol_mgr.iterate_dir(root, |x| {
+                file_infos.push((x.name.clone(), x.ctime));
             }).await?;
             file_infos.sort_by_key(|(_, ctime)| *ctime);
 
             let mut files = Vec::new();
             for name in file_infos.iter().map(|(name, _)| name) {
-                let file = vol_mgr.open_file_in_dir(*root, name, Mode::ReadOnly).await?;
-                let rhythm = RhythmData::new(vol_mgr, &file).await?;
+                let file = vol_mgr.open_file_in_dir(root, name, Mode::ReadOnly).await?;
+                let rhythm = RhythmData::new(&mut vol_mgr, &file).await?;
 
                 files.push(Wav { name: name.clone(), file, rhythm });
             }
@@ -86,6 +116,7 @@ impl<'a> Steps<'a> {
         Ok(Self {
             state: State::Sync,
             event_buf: None,
+            vol_mgr,
             files,
             cuts: core::array::from_fn(|_| None),
             seq: Vec::new(),
@@ -99,14 +130,10 @@ impl<'a> Steps<'a> {
         })
     }
 
-    pub async fn push_wav(&mut self, wav: Wav) {
-        self.files.push(wav);
-    }
-
     /// assign `Cut` from file to specified pad
     ///
     /// returns `true` if enough `Cut`s have been assigned to represent the whole file
-    pub async fn assign_pad(&mut self, vol_mgr: &mut VolMgr<'_>, file_index: Option<usize>, pad_index: Option<u8>, step_count: Option<u8>) -> Result<bool, Error> {
+    pub async fn assign_pad(&mut self, file_index: Option<usize>, pad_index: Option<u8>, step_count: Option<u8>) -> Result<bool, Error> {
         // remaining steps in file to be assigned
         static REM_4_FILE: AsyncMutex<Option<(u8, usize)>> = AsyncMutex::new(None);
 
@@ -142,7 +169,7 @@ impl<'a> Steps<'a> {
                     // reload if currently targeting pad
                     if let Some(i) = self.seq_index {
                         if self.seq.get(i).is_some_and(|&i| i == pad_index) {
-                            self.load_seq_index(vol_mgr, i).await?;
+                            self.load_seq_index(i).await?;
                         }
                     }
 
@@ -162,55 +189,25 @@ impl<'a> Steps<'a> {
         Ok(true)
     }
 
-    pub async fn set_clock_in_tempo(&mut self, tempo: Option<f32>) -> Result<(), Error> {
-        // static PREV_OFFSET: AsyncMutex<Option<u32>> = AsyncMutex::new(None);
-
-        if let Some(anchor_tempo) = self.anchor_tempo {
-            match tempo {
-                Some(tempo) if (anchor_tempo / tempo).is_normal() => {
-                    self.tap_speed = tempo * 2.0 / anchor_tempo;
-
-                    // let prev_offset = *PREV_OFFSET.lock().await.get_or_insert(
-                    //     self.cut_offset()?
-                    // );
-                    // let pulse_len = self.step_len()? as f32 / 32.0;
-                    // let offset_diff = self.cut_offset()? - prev_offset;
-
-                    // let pos_drift = offset_diff as f32 % pulse_len;
-                    // let neg_drift = offset_diff as f32 - pos_drift;
-
-                    // let drift = if pos_drift < neg_drift {
-                    //     pos_drift
-                    // } else {
-                    //     -neg_drift
-                    // };
-
-                    // defmt::info!("drift: {}", drift);
-
-                    // let offset = self.cut_offset()? as f32 - drift;
-                    // let offset = self.cut_offset()? as f32 - self.cut_offset()? as f32 % pulse_len;
-
-                    // self.cut_seek_from_start(offset as u32)?;
-
-                    // *PREV_OFFSET.lock().await = Some(self.cut_offset()?);
-
-                    return Ok(());
-                },
-                None => {
-                    // *ANCHOR.lock().await = None;
-
-                    return Ok(());
-                },
-                _ => (),
+    pub fn set_clock_in_tempo(&mut self, tempo: f32) -> Result<(), Error> {
+        if let Some(anchor) = self.anchor_tempo {
+            if (anchor / tempo).is_normal() {
+                self.tap_speed = tempo * 2.0 / anchor;
+                defmt::info!("anchor: {} | tempo: {} | tap_speed: {}",
+                    anchor,
+                    tempo,
+                    self.tap_speed
+                );
             }
-        }
+            return Ok(());
+        };
         Err(Error::NoFileLoaded)
     }
 
-    pub async fn read_grain(&mut self, vol_mgr: &mut VolMgr<'_>) -> Result<Box<[u8]>,  Error> {
+    pub async fn read_grain(&mut self) -> Result<Box<[u8]>,  Error> {
         // handle state
-        if self.is_quantum(vol_mgr).await? {
-            self.update(vol_mgr).await?;
+        if self.is_quantum().await? {
+            self.update().await?;
             self.led.toggle();
 
             // retrig
@@ -218,40 +215,40 @@ impl<'a> Steps<'a> {
                 inner: Desync::Loop { length }, step, index, ..
             } = self.state {
                 if let Some(curr_idx) = self.seq_index {
-                    let start = self.seq_length_until_index(vol_mgr, index)? + step * self.step_len(vol_mgr)?;
-                    let end = self.seq_length_until_index(vol_mgr, index)? + u32::from((length + step) * Fraction::from(self.step_len(vol_mgr)?));
-                    let offset = self.seq_length_until_index(vol_mgr, curr_idx)? + self.cut_offset(vol_mgr)?;
+                    let start = self.seq_length_until_index(index)? + step * self.step_len()?;
+                    let end = self.seq_length_until_index(index)? + u32::from((length + step) * Fraction::from(self.step_len()?));
+                    let offset = self.seq_length_until_index(curr_idx)? + self.cut_offset()?;
 
                     if offset > end
                         || offset < start
-                        && offset > (start + end) % self.cut_length(vol_mgr)?
+                        && offset > (start + end) % self.cut_length()?
                     {
-                        self.load_seq_index(vol_mgr, index).await?;
-                        let offset = step * self.step_len(vol_mgr)?;
-                        self.cut_seek_from_start(vol_mgr, offset)?;
+                        self.load_seq_index(index).await?;
+                        self.cut_seek_from_start(step * self.step_len()?)?;
                     }
                 }
             }
         }
 
-        let mut out = vec![u8::MAX / 2; self.grain_len(vol_mgr)?].into_boxed_slice();
-        let mut buf = vec![u8::MAX / 2; (self.grain_len(vol_mgr)? as f32 * self.speed()) as usize].into_boxed_slice();
+        let mut out = vec![u8::MAX / 2; self.grain_len()?].into_boxed_slice();
+        let speed = self.speed();
+        let mut buf = vec![u8::MAX / 2; (self.grain_len()? as f32 * speed) as usize].into_boxed_slice();
 
         // read cut(s) until buffer full
-        let mut bytes = self.read_file(vol_mgr, &mut buf).await;
+        let mut bytes = self.read_file(&mut buf).await;
         while bytes.is_err()
             || bytes.as_ref().is_ok_and(|x| *x < buf.len())
-            || self.cut_offset(vol_mgr)? > self.cut_length(vol_mgr)?
+            || self.cut_offset()? > self.cut_length()?
         {
-            self.next_seq_index(vol_mgr).await?;
+            self.next_seq_index().await?;
 
-            bytes = self.read_file(vol_mgr, &mut buf).await;
+            bytes = self.read_file(&mut buf).await;
         }
 
         if self.running || !matches!(self.state, State::Sync) {
             // resample via linear interpolation
             for (i, x) in out.iter_mut().enumerate() {
-                let buf_i = i as f32 * self.speed();
+                let buf_i = i as f32 * speed;
                 *x = (buf_i.fract() * *buf.get(buf_i as usize).unwrap_or(&(u8::MAX / 2)) as f32 +
                     (1.0 - buf_i.fract()) * *buf.get(buf_i as usize + 1).unwrap_or(&(u8::MAX / 2)) as f32
                 ) as u8;
@@ -259,8 +256,8 @@ impl<'a> Steps<'a> {
         }
         
         // sync desync
-        let length = self.seq_length_until_index(vol_mgr, self.seq.len())?;
-        let grain_len = self.grain_len(vol_mgr)?;
+        let length = self.seq_length_until_index(self.seq.len())?;
+        let grain_len = self.grain_len()?;
         if let State::Desync { ref mut counter, .. } = self.state {
             // convert desync counter to seq_index
             let seq_index = (0..self.seq.len())
@@ -273,7 +270,7 @@ impl<'a> Steps<'a> {
                                     .iter()
                                     .try_fold(0, |acc, i| {
                                         if let Some(Some(cut)) = self.cuts.get(*i as usize) {
-                                            let pcm_length = vol_mgr.file_length(cut.src_file)? - 0x2c;
+                                            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
                                             return Ok(acc + pcm_length * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
                                         }
                                         Err(Error::PadOutOfBounds)
@@ -310,9 +307,9 @@ impl<'a> Steps<'a> {
         Ok(())
     }
 
-    pub fn set_running(&mut self, vol_mgr: &mut VolMgr<'_>, running: bool) -> Result<(), Error> {
+    pub fn set_running(&mut self, running: bool) -> Result<(), Error> {
         self.running = running;
-        self.cut_seek_from_start(vol_mgr, 0)
+        self.cut_seek_from_start(0)
     }
 
     pub fn set_speed_mod(&mut self, speed: Option<f32>) {
@@ -330,13 +327,24 @@ impl<'a> Steps<'a> {
         Err(Error::NoFileLoaded)
     }
 
+    pub fn step_len(&self) -> Result<u32, Error> {
+        if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
+            return Ok(self.cut_length()? / cut.step_count as u32);
+        }
+        Err(Error::NoFileLoaded)
+    }
+
+    pub fn speed(&self) -> f32 {
+        self.sync_speed * self.tap_speed * self.speed_mod.unwrap_or(1.0)
+    }
+
     /// goto next non-empty step of sequence, if available
-    async fn next_seq_index(&mut self, vol_mgr: &mut VolMgr<'_>) -> Result<(), Error> {
+    async fn next_seq_index(&mut self) -> Result<(), Error> {
         if let Some(init) = self.seq_index {
             for addend in  1..=self.seq.len() {
                 let i = (init + addend) % self.seq.len();
                 if self.seq.get(i).is_some_and(|i| self.cuts.get(*i as usize).is_some_and(|c| c.is_some())) {
-                    self.load_seq_index(vol_mgr, i).await?;
+                    self.load_seq_index(i).await?;
 
                     return Ok(());
                 }
@@ -345,7 +353,7 @@ impl<'a> Steps<'a> {
         Err(Error::NoFileLoaded)
     }
 
-    async fn load_seq_index(&mut self, vol_mgr: &mut VolMgr<'_>, index: usize) -> Result<(), Error> {
+    async fn load_seq_index(&mut self, index: usize) -> Result<(), Error> {
         if index >= self.cuts.len() {
             return Err(Error::PadOutOfBounds);
         }
@@ -360,29 +368,29 @@ impl<'a> Steps<'a> {
                 defmt::info!("anchor tempo: {}", self.anchor_tempo);
             }
 
-            self.cut_seek_from_start(vol_mgr, 0)?;
+            self.cut_seek_from_start(0)?;
             return Ok(());
         }
         Err(Error::NoFileLoaded)
     }
 
-    async fn read_file(&mut self, vol_mgr: &mut VolMgr<'_>, buffer: &mut [u8]) -> Result<usize, Error> {
+    async fn read_file(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
         if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
-            return Ok(vol_mgr.read(cut.src_file, buffer).await?);
+            return Ok(self.vol_mgr.read(cut.src_file, buffer).await?);
         }
         Err(Error::NoFileLoaded)
     }
 
-    async fn update(&mut self, vol_mgr: &mut VolMgr<'_>) -> Result<(), Error> {
+    async fn update(&mut self) -> Result<(), Error> {
         if let Some(event) = self.event_buf.as_ref() {
             self.state = match event {
                 &Event::Sync => {
                     if let State::Desync { counter, .. } = self.state {
-                        let seq_index = self.counter_to_seq_index(vol_mgr, counter)?;
-                        let cut_start = self.seq_length_until_index(vol_mgr, seq_index)?;
+                        let seq_index = self.counter_to_seq_index(counter)?;
+                        let cut_start = self.seq_length_until_index(seq_index)?;
 
-                        self.load_seq_index(vol_mgr, seq_index).await?;
-                        self.cut_seek_from_start(vol_mgr, counter - cut_start)?;
+                        self.load_seq_index(seq_index).await?;
+                        self.cut_seek_from_start(counter - cut_start)?;
                         defmt::info!("sync to {} (index {})!", counter, seq_index);
                     }
                     State::Sync
@@ -392,9 +400,8 @@ impl<'a> Steps<'a> {
                         State::Desync { inner: Desync::Loop { .. }, counter, index, .. } => (counter, index),
                         _ => {
                             let index = self.seq_index.ok_or(Error::NoFileLoaded)?;
-                            let counter = self.seq_length_until_index(vol_mgr, index)? + self.cut_offset(vol_mgr)?;
-                            let offset = step * self.step_len(vol_mgr)?;
-                            self.cut_seek_from_start(vol_mgr, offset)?;
+                            let counter = self.seq_length_until_index(index)? + self.cut_offset()?;
+                            self.cut_seek_from_start(self.step_len()? * step)?;
                             (counter, index)
                         },
                     };
@@ -412,12 +419,11 @@ impl<'a> Steps<'a> {
                         State::Desync { counter, index, .. } => (counter, index),
                         _ => {
                             let index = self.seq_index.ok_or(Error::NoFileLoaded)?;
-                            let counter = self.seq_length_until_index(vol_mgr, index)? + self.cut_offset(vol_mgr)?;
+                            let counter = self.seq_length_until_index(index)? + self.cut_offset()?;
                             (counter, index)
                         },
                     };
-                    let offset = step * self.step_len(vol_mgr)?;
-                    self.cut_seek_from_start(vol_mgr, offset)?;
+                    self.cut_seek_from_start(self.step_len()? * step)?;
 
                     State::Desync {
                         inner: Desync::Loop { length },
@@ -433,7 +439,7 @@ impl<'a> Steps<'a> {
                         .filter(|&v| self.cuts.len() > v as usize)
                         .collect::<Vec<_>>();
                     self.seq.clone_from(&cuts);
-                    match self.load_seq_index(vol_mgr, 0).await {
+                    match self.load_seq_index(0).await {
                         Err(Error::NoFileLoaded) => (),
                         Err(e) => return Err(e),
                         _ => (),
@@ -449,7 +455,7 @@ impl<'a> Steps<'a> {
         Ok(())
     }
 
-    async fn is_quantum(&self, vol_mgr: &mut VolMgr<'_>) -> Result<bool, Error> {
+    async fn is_quantum(&self) -> Result<bool, Error> {
         if !self.is_file_loaded() {
             return Ok(true);
         }
@@ -458,22 +464,18 @@ impl<'a> Steps<'a> {
             || matches!(self.event_buf, Some(Event::Hold {..})) && !self.running
             || matches!(self.state, State::Desync { inner: Desync::Loop { .. }, .. })
         {
-            return Ok(self.cut_offset(vol_mgr)? % (self.step_len(vol_mgr)? / 16) < (self.grain_len(vol_mgr)? as f32 * self.speed()) as u32)
+            return Ok(self.cut_offset()? % (self.step_len()? / 16) < (self.grain_len()? as f32 * self.speed()) as u32)
         }
-        Ok(self.cut_offset(vol_mgr)? % (self.step_len(vol_mgr)? / 2) < (self.grain_len(vol_mgr)? as f32 * self.speed()) as u32)
-    }
-
-    fn speed(&self) -> f32 {
-        self.sync_speed * self.tap_speed * self.speed_mod.unwrap_or(1.0)
+        Ok(self.cut_offset()? % (self.step_len()? / 2) < (self.grain_len()? as f32 * self.speed()) as u32)
     }
 
     /// convert desync counter to seq_index
-    fn counter_to_seq_index(&self, vol_mgr: &mut VolMgr<'_>, counter: u32) -> Result<usize, Error> {
+    fn counter_to_seq_index(&self, counter: u32) -> Result<usize, Error> {
         (0..self.seq.len())
             .try_fold(None, |res, idx| -> Result<Option<usize>, Error> {
                 match res {
                     None => {
-                        let cut_end = self.seq_length_until_index(vol_mgr, idx + 1)?;
+                        let cut_end = self.seq_length_until_index(idx + 1)?;
                         if cut_end > counter {
                             return Ok(Some(idx));
                         }
@@ -484,25 +486,18 @@ impl<'a> Steps<'a> {
             })?.ok_or(Error::NoFileLoaded)
     }
 
-    fn step_len(&self, vol_mgr: &mut VolMgr<'_>) -> Result<u32, Error> {
+    fn grain_len(&self) -> Result<usize, Error> {
+        Ok(self.step_len()? as usize / 16)
+    }
+
+    fn cut_length(&self) -> Result<u32, Error> {
         if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
-            return Ok(self.cut_length(vol_mgr)? / cut.step_count as u32);
+            return Ok((self.vol_mgr.file_length(cut.src_file)? - 0x2c) * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
         }
         Err(Error::NoFileLoaded)
     }
 
-    fn grain_len(&self, vol_mgr: &mut VolMgr<'_>) -> Result<usize, Error> {
-        Ok(self.step_len(vol_mgr)? as usize / 16)
-    }
-
-    fn cut_length(&self, vol_mgr: &mut VolMgr<'_>) -> Result<u32, Error> {
-        if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
-            return Ok((vol_mgr.file_length(cut.src_file)? - 0x2c) * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
-        }
-        Err(Error::NoFileLoaded)
-    }
-
-    fn seq_length_until_index(&self, vol_mgr: &mut VolMgr<'_>, seq_index: usize) -> Result<u32, Error> {
+    fn seq_length_until_index(&self, seq_index: usize) -> Result<u32, Error> {
         if seq_index >= self.cuts.len()  {
             return Err(Error::PadOutOfBounds);
         }
@@ -510,7 +505,7 @@ impl<'a> Steps<'a> {
             .iter()
             .try_fold(0, |acc, i| {
                 if let Some(Some(cut)) = self.cuts.get(*i as usize) {
-                    let pcm_length = vol_mgr.file_length(cut.src_file)? - 0x2c;
+                    let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
                     return Ok(acc + pcm_length * cut.step_count as u32 / cut.src_rhythm.step_count() as u32);
                 }
                 Ok(acc)
@@ -518,20 +513,20 @@ impl<'a> Steps<'a> {
         ret
     }
 
-    fn cut_offset(&self, vol_mgr: &mut VolMgr<'_>) -> Result<u32, Error> {
+    fn cut_offset(&self) -> Result<u32, Error> {
         if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
-            let pcm_length = vol_mgr.file_length(cut.src_file)? - 0x2c;
+            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
             let start = 0x2c + pcm_length * cut.step_offset as u32 / cut.src_rhythm.step_count() as u32;
-            return vol_mgr.file_offset(cut.src_file)?.checked_sub(start).ok_or(Error::StepOutOfBounds);
+            return self.vol_mgr.file_offset(cut.src_file)?.checked_sub(start).ok_or(Error::StepOutOfBounds);
         }
         Err(Error::NoFileLoaded)
     }
 
-    fn cut_seek_from_start(&mut self, vol_mgr: &mut VolMgr<'_>, offset: u32) -> Result<(), Error> {
+    fn cut_seek_from_start(&mut self, offset: u32) -> Result<(), Error> {
         if let Some(Some(cut)) = self.seq_index.and_then(|v| self.seq.get(v).and_then(|v| self.cuts.get(*v as usize))) {
-            let pcm_length = vol_mgr.file_length(cut.src_file)? - 0x2c;
+            let pcm_length = self.vol_mgr.file_length(cut.src_file)? - 0x2c;
             let start = 0x2c + pcm_length * cut.step_offset as u32 / cut.src_rhythm.step_count() as u32;
-            return Ok(vol_mgr.file_seek_from_start(cut.src_file, start + offset)?);
+            return Ok(self.vol_mgr.file_seek_from_start(cut.src_file, start + offset)?);
         }
         Err(Error::NoFileLoaded)
     }

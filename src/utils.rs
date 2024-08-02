@@ -2,10 +2,10 @@ use defmt::Format;
 
 #[macro_export]
 macro_rules! expect {
-    ( $result:expr, $message:expr ) => {
+    ( $result:expr, $message:expr $(,)? ) => {
         match $result {
             Ok(v) => v,
-            Err(e) => defmt::panic!("{}: {}", $message, Debug2Format(&e))
+            Err(e) => defmt::panic!("{}: {}", $message, defmt::Debug2Format(&e))
         }
     }
 }
@@ -22,22 +22,10 @@ macro_rules! lock_async_mut {
     }
 }
 
-/// for `AsyncMutex<Option<..>>`
-#[macro_export]
-macro_rules! lock_async_ref {
-    ( $mutex:expr ) => {
-        $mutex
-            .lock()
-            .await
-            .as_ref()
-            .unwrap()
-    }
-}
-
 pub type AsyncMutex<T> = embassy_sync::mutex::Mutex<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T>;
 
 /// fraction backed by `u32` numerator and denominator
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Format)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Format)]
 pub struct Fraction {
     numerator: u32,
     denominator: u32,

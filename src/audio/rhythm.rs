@@ -1,29 +1,39 @@
 use crate::audio::SAMPLE_RATE;
-use crate::audio::VolMgr;
-use crate::audio::Error;
 
 use defmt::*;
 
+use embedded_fatfs::{Error, File, OemCpConverter, ReadWriteSeek, TimeProvider};
+use embedded_io_async::{Read, Seek, SeekFrom};
 use micromath::F32Ext;
 
 #[derive(Debug, Copy, Clone)]
 pub struct RhythmData {
-    step_count: u8,
+    step_count: usize,
     tempo: f32,
 }
 
 impl RhythmData {
-    pub async fn new(vol_mgr: &mut VolMgr<'_>, file: &embedded_sdmmc::RawFile) -> Result<Self, Error> {
-        vol_mgr.file_seek_from_start(*file, 0x2c)?;
+    pub async fn new<IO, TP, OCC>(
+        file: &mut File<'_, IO, TP, OCC>,
+        file_length: u64
+    ) -> Result<Self, Error<IO::Error>>
+    where
+        IO: ReadWriteSeek,
+        TP: TimeProvider,
+        OCC: OemCpConverter,
+    {
         const FFT_LEN: usize = 64;
         const HOP_SIZE: usize = 32;
+
+        // seek to pcm start
+        file.seek(SeekFrom::Start(0x2c)).await?;
 
         info!("calculating energies...");
         let mut correlations = [0.0; 63];
         let mut buf = [0; FFT_LEN];
         let mut prev_spectrum = None;
-        while vol_mgr.read(*file, &mut buf).await.is_ok_and(|n| n == FFT_LEN) {
-            vol_mgr.file_seek_from_current(*file, HOP_SIZE as i32 - FFT_LEN as i32)?;
+        while file.read_exact(&mut buf).await.is_ok() {
+            file.seek(SeekFrom::Current(HOP_SIZE as i64 - FFT_LEN as i64)).await?;
 
             let mut samples = [0.0; FFT_LEN];
             samples
@@ -47,8 +57,8 @@ impl RhythmData {
                     .sum();
 
                 // wavelet correlation
-                let pcm_length = vol_mgr.file_length(*file)? - 0x2c;
-                let pcm_offset = vol_mgr.file_offset(*file)? - 0x2c;
+                let pcm_length = file_length - 0x2c;
+                let pcm_offset = file.stream_position().await? - 0x2c;
                 correlations
                     .iter_mut()
                     .enumerate()
@@ -62,16 +72,16 @@ impl RhythmData {
             }
             prev_spectrum = Some(real);
         }
-        vol_mgr.file_seek_from_start(*file, 0x2c)?;
+        file.seek(SeekFrom::Start(0x2c)).await?;
         let step_count = correlations
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| i as u8 + 1)
+            .map(|(i, _)| i + 1)
             .unwrap();
 
         let tempo = step_count as f32 /
-            (vol_mgr.file_length(*file)? - 0x2c) as f32 *
+            (file_length - 0x2c) as f32 *
             SAMPLE_RATE.0 as f32 *
             60.0;
         info!("step_count: {}, tempo: {}", step_count, tempo);
@@ -79,7 +89,7 @@ impl RhythmData {
         Ok(RhythmData { step_count, tempo })
     }
 
-    pub fn step_count(&self) -> u8 {
+    pub fn step_count(&self) -> usize {
         self.step_count
     }
 

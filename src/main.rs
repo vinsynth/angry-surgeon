@@ -3,11 +3,12 @@
 
 mod audio;
 mod fs;
-mod fx;
 mod pwm;
-mod rhythm;
 mod utils;
 
+use audio::fx::Bitcrush;
+use audio::steps::{Command, Event, Steps};
+use fs::SdioCard;
 use pwm::InterruptPwm;
 use utils::AsyncMutex;
 
@@ -15,38 +16,36 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 extern crate alloc;
+use alloc::vec;
 use alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::string::String;
 
 use core::cell::RefCell;
 
-use defmt::*;
-use micromath::F32Ext;
-
 use cortex_m::peripheral::NVIC;
 
-use embassy_executor::{SendSpawner, Spawner};
+use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::CriticalSectionMutex as SyncMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex as RawMutex;
-use embassy_sync::channel::{Channel, Sender};
+use embassy_sync::channel::Channel;
 use embassy_time::Timer;
 
 use embassy_stm32::{gpio, interrupt, sdmmc};
-use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::peripherals::{ADC1, TIM4};
 use embassy_stm32::time::Hertz;
 
-pub const PAD_COUNT: u8 = 8;
+const PAD_COUNT: usize = 8;
+const ADC_MAX: u16 = 4095;
 
 type RingBuf<T, const CAP: usize> = arraydeque::ArrayDeque<T, CAP, arraydeque::Wrapping>;
 
-static PWM: SyncMutex<RefCell<Option<InterruptPwm<TIM4>>>> = SyncMutex::new(RefCell::new(None));
-static SPAWNER: SyncMutex<RefCell<Option<SendSpawner>>> = SyncMutex::new(RefCell::new(None));
-
 static ADC: AsyncMutex<Option<embassy_stm32::adc::Adc<ADC1>>> = AsyncMutex::new(None);
 static MTX: AsyncMutex<RefCell<Vec<u8>>> = AsyncMutex::new(RefCell::new(Vec::new()));
-static STEPS: AsyncMutex<Option<audio::Steps>> = AsyncMutex::new(None);
-static BITCRUSH: AsyncMutex<Option<fx::Bitcrush>> = AsyncMutex::new(None);
+static PWM: SyncMutex<RefCell<Option<InterruptPwm<TIM4>>>> = SyncMutex::new(RefCell::new(None));
+static BITCRUSH: AsyncMutex<Bitcrush> = AsyncMutex::new(Bitcrush::new());
+
+static STEPS_CHANNEL: Channel<RawMutex, Command, 1> = Channel::new();
 
 embassy_stm32::bind_interrupts!(struct Irqs {
     SDIO => sdmmc::InterruptHandler<embassy_stm32::peripherals::SDIO>;
@@ -57,7 +56,7 @@ static HEAP: embedded_alloc::Heap = embedded_alloc::Heap::empty();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    info!("init heap...");
+    defmt::info!("init heap...");
     {
         use core::mem::MaybeUninit;
         const HEAP_SIZE: usize = 64000;
@@ -88,7 +87,7 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_stm32::init(config);
 
-    info!("init sdmmc...");
+    defmt::info!("init sdmmc...");
     let mut sdmmc = embassy_stm32::sdmmc::Sdmmc::new_4bit(
         p.SDIO,
         Irqs,
@@ -105,33 +104,35 @@ async fn main(spawner: Spawner) {
     let mut err = None;
     while let Err(e) = sdmmc.init_card(Hertz::mhz(16)).await {
         if err != Some(e) {
-            info!("waiting for card error, retrying: {:?}", e);
+            defmt::info!("waiting for card error, retrying: {:?}", e);
             err = Some(e);
         }
     }
 
-    let card = fs::SdioCard::new(sdmmc);
-
-    let vol_mgr = embedded_sdmmc::VolumeManager::new(card, fs::DummyTimesource::default());
+    let card = SdioCard::new(sdmmc);
+    let slice = crate::expect!(
+        card.into_stream_slice().await,
+        "failed to init strea slice",
+    );
+    let fs_options = embedded_fatfs::FsOptions::new();
+    let fs = crate::expect!(
+        embedded_fatfs::FileSystem::new(slice, fs_options).await,
+        "failed to init filesystem",
+    );
+    let root = fs.root_dir();
 
     let led = gpio::Output::new(
         p.PC13,
         gpio::Level::High,
         gpio::Speed::Low,
     );
-    let steps = crate::expect!(
-        audio::Steps::new(led, vol_mgr).await,
-        "failed to init steps"
+
+    let mut steps = crate::expect!(
+        Steps::new(led, root).await,
+        "failed to init steps",
     );
-    STEPS.lock().await.replace(steps);
 
-    let bitcrush = fx::Bitcrush::new();
-    BITCRUSH.lock().await.replace(bitcrush);
-
-    let send_spawner = SendSpawner::for_current_executor().await;
-    SPAWNER.lock(|s| s.replace(Some(send_spawner)));
-
-    info!("init pwm...");
+    defmt::info!("init pwm...");
     let mut pwm = InterruptPwm::new(
         p.TIM4,
         None,
@@ -145,15 +146,7 @@ async fn main(spawner: Spawner) {
     PWM.lock(|p| p.replace(Some(pwm)));
     unsafe { NVIC::unmask(embassy_stm32::interrupt::TIM4) };
 
-    info!("init clock sync...");
-    let clk_sw = ExtiInput::new(p.PB1, p.EXTI1, gpio::Pull::Up);
-    let _ = spawner.spawn(handle_clock_in(clk_sw));
-
-    info!("init mode...");
-    let mode_sw = ExtiInput::new(p.PA0, p.EXTI0, gpio::Pull::Up);
-    let _ = spawner.spawn(handle_mode(mode_sw));
-
-    info!("init matrix...");
+    defmt::info!("init matrix...");
     macro_rules! new_output {
         ( $x:expr ) => {
             gpio::Output::new(
@@ -187,12 +180,23 @@ async fn main(spawner: Spawner) {
         [mx_output0, mx_output1, mx_output2, mx_output3],
     ));
 
-    info!("init adc...");
+    defmt::info!("init adc...");
     let adc = embassy_stm32::adc::Adc::new(p.ADC1);
+
     ADC.lock().await.replace(adc);
 
-    let cut_sw = new_input!(p.PB12);
-    let seq_sw = new_input!(p.PB10);
+    let oneshot_push_sw = new_input!(p.PB10);
+    let oneshot_play_sw = new_input!(p.PB0);
+    let cut_sw = new_input!(p.PB14);
+    let seq_sw = new_input!(p.PB12);
+
+    let _ = spawner.spawn(handle_pads(
+        p.PA4,
+        oneshot_push_sw,
+        oneshot_play_sw,
+        cut_sw,
+        seq_sw,
+    ));
 
     let _ = spawner.spawn(handle_joystick(
         p.PA2,
@@ -200,69 +204,80 @@ async fn main(spawner: Spawner) {
         new_input!(p.PB13),
     ));
 
-    let _ = spawner.spawn(handle_pads(
-        p.PA4,
-        cut_sw,
-        seq_sw,
-    ));
-
-    info!("idle start!");
+    defmt::info!("enter idle!");
     loop {
-        Timer::after_millis(1000).await;
-    }
-}
+        // handle steps
+        use block_device_adapters::StreamSliceError;
+        use embedded_fatfs::Error;
 
-#[embassy_executor::task]
-async fn handle_clock_in(mut input: ExtiInput<'static>) {
-    let mut past = None;
-    let mut buffer: RingBuf<u64, 24> = RingBuf::new();
-    loop {
-        while embassy_time::with_timeout(
-            embassy_time::Duration::from_millis(84),
-            input.wait_for_rising_edge()
-        ).await.is_ok() {
-            let now = embassy_time::Instant::now();
-            if let Some(past) = past {
-                buffer.push_back(now.saturating_duration_since(past).as_micros());
-
-                // mean of all buffered intervals scaled to higher frequency
-                let micros = {
-                    let max = buffer.iter().copied().max().unwrap_or(0);
-                    let maxes = buffer
-                        .iter()
-                        .map(|&v| v as f32)
-                        .filter(|&v| (max as f32 / v).round() == 1.0)
-                        .collect::<Vec<_>>();
-                    let mean_max = maxes.iter().sum::<f32>() / maxes.len() as f32;
-                    buffer
-                        .iter()
-                        .map(|&v| {
-                            v * (mean_max as f32 / v as f32).round() as u64
-                        })
-                        .sum::<u64>() as f32 / buffer.len() as f32
-                };
-
-                let tempo = 1000000.0 * 60.0 / 24.0 / micros;
-                match lock_async_mut!(STEPS).set_clock_in_tempo(tempo) {
-                    Err(audio::Error::NoFileLoaded) => continue,
-                    Err(e) => defmt::panic!("failed to tap: {}", Debug2Format(&e)),
-                    _ => (),
-                };
+        let command = STEPS_CHANNEL.receive().await;
+        match command {
+            Command::PushEvent { event } => {
+                steps.push_event(event);
+                defmt::info!("pushed event {}!", event);
+            },
+            Command::PushToOneshots { path, pad_index } => {
+                crate::expect!(
+                    steps.push_to_oneshots(path, pad_index).await,
+                    "failed to push to oneshots",
+                );
+                defmt::info!("pushed oneshot to pad {}!", pad_index);
             }
-            past = Some(now);
+            Command::PlayOneshot { pad_index } => {
+                crate::expect!(
+                    steps.play_oneshot(pad_index).await,
+                    "failed to play oneshot",
+                );
+                defmt::info!("playing oneshot {}!", pad_index);
+            }
+            Command::PushToCuts { path, step_count, pad_index } => {
+                crate::expect!(
+                    steps.push_to_cuts(path, step_count, pad_index).await,
+                    "failed to push to cuts",
+                );
+                defmt::info!("pushed {} steps to pad {}!", step_count, pad_index);
+            },
+            Command::BakeCuts => {
+                let _ = steps.bake_cuts();
+                defmt::info!("baked cuts!");
+            },
+            Command::PushToSequence { pad_index } => {
+                steps.push_to_sequence(pad_index);
+                defmt::info!("pushed pad {} to sequence!", pad_index);
+            },
+            Command::BakeSequence => {
+                match steps.bake_sequence().await {
+                    Err(StreamSliceError::Other(Error::NotFound)) => (),
+                    Err(e) => defmt::panic!("failed to bake sequence: {}", defmt::Debug2Format(&e)),
+                    _ => (),
+                }
+                defmt::info!("baked sequence!");
+            },
+            Command::StepCount { sender } => sender.send(steps.step_count().unwrap_or(0)).await,
+            Command::Paths { sender } => sender.send(steps.paths()).await,
+            Command::ReadCut { sender } => {
+                let mut grain = match steps.read_cut().await {
+                    Err(StreamSliceError::Other(Error::NotFound)) => Box::new([u8::MAX / 2; 512]),
+                    Err(e) => defmt::panic!("failed to read cut: {}", defmt::Debug2Format(&e)),
+                    Ok(g) => g,
+                };
+                let oneshot = match steps.read_oneshot().await {
+                    Err(StreamSliceError::Other(Error::NotFound)) => {
+                        vec![u8::MAX / 2; grain.len()].into_boxed_slice()
+                    },
+                    Err(e) => defmt::panic!("failed to read oneshot: {}", defmt::Debug2Format(&e)),
+                    Ok(g) => g,
+                };
+                grain
+                    .iter_mut()
+                    .zip(oneshot.iter())
+                    .for_each(|(g, o)| {
+                        *g = ((*g as f32 + *o as f32) / 2.0) as u8;
+                    });
+                BITCRUSH.lock().await.crush(&mut grain);
+                sender.send(grain).await;
+            },
         }
-        buffer = RingBuf::new();
-        past = None;
-    }
-}
-
-#[embassy_executor::task]
-async fn handle_mode(mut input: ExtiInput<'static>) {
-    loop {
-        input.wait_for_falling_edge().await;
-        let _ = lock_async_mut!(STEPS).set_running(false);
-        input.wait_for_falling_edge().await;
-        let _ = lock_async_mut!(STEPS).set_running(true);
     }
 }
 
@@ -276,11 +291,10 @@ async fn handle_matrix(
     loop {
         let mut downs = prev_downs.clone();
 
-        // process matrix
-        for (o_idx, mx_output) in mx_outputs.iter_mut().enumerate() {
+        for (out_idx, mx_output) in mx_outputs.iter_mut().enumerate() {
             mx_output.set_low();
-            for (i_idx, mx_input) in mx_inputs.iter().enumerate() {
-                let index = i_idx as u8 * 4 + o_idx as u8;
+            for (in_idx, mx_input) in mx_inputs.iter().enumerate() {
+                let index = in_idx as u8 * 4 + out_idx as u8;
                 if mx_input.is_high() && downs.contains(&index) {
                     downs.retain(|&v| v != index);
                 } else if mx_input.is_low() && !downs.contains(&index) && index < 16 {
@@ -298,79 +312,179 @@ async fn handle_matrix(
 }
 
 #[embassy_executor::task]
-async fn handle_pads(
-    mut select_pin: impl embassy_stm32::adc::AdcPin<ADC1> + 'static,
+async fn handle_pads (
+    mut fs_pin: impl embassy_stm32::adc::AdcPin<ADC1> + 'static,
+    push_oneshot_sw: gpio::Input<'static>,
+    play_oneshot_sw: gpio::Input<'static>,
     cut_sw: gpio::Input<'static>,
     seq_sw: gpio::Input<'static>,
 ) {
-    let mut buf: RingBuf<u16, 16> = RingBuf::new();
+    enum Switch {
+        None,
+        PushToOneshots,
+        PlayOneshot,
+        PushToCuts { pad_index: Option<usize> },
+        PushToSequence,
+    }
+    let mut switch = Switch::None;
+
+    static PATHS_CHANNEL: Channel<RawMutex, Vec<String>, 1> = Channel::new();
+    let mut filepaths: Option<Vec<String>> = None;
+    let mut prev_filepath = None;
+
+    let mut adc_buf: RingBuf<u16, 16> = RingBuf::new();
+    let mut filepath = |adc: u16, filepaths: Vec<String>| {
+        adc_buf.push_back(adc);
+        let length = adc_buf.len();
+        let wma = adc_buf
+            .iter()
+            .enumerate()
+            .fold(0.0, |acc, (i, &v)| {
+                acc + v as f32 * (i + 1) as f32
+            }) / (length * (length + 1) / 2) as f32;
+        let file_index = ((wma / ADC_MAX as f32).clamp(0.0, 1.0) * filepaths.len() as f32) as usize;
+        filepaths[file_index].clone()
+    };
+
     let mut prev_downs = Vec::new();
-    let mut file_loaded = false;
-    let mut cut_index = None;
-    let mut seq = Vec::new();
+
     loop {
         let downs = MTX.lock().await.borrow().clone();
-        if cut_sw.is_low() {
-            buf.push_back(lock_async_mut!(ADC).read(&mut select_pin));
 
-            let wma = {
-                let length = buf.len();
-                buf
-                    .iter()
-                    .enumerate()
-                    .fold(0.0, |acc, (i, &v)| {
-                        acc + v as f32 * (i + 1) as f32
-                    }) / (length * (length + 1) / 2) as f32
-            };
-            let file_count = lock_async_ref!(STEPS).file_count();
-            let file_index = ((wma / 4095.0).clamp(0.0, 1.0) * file_count as f32) as usize;
-            file_loaded = true;
+        match switch {
+            Switch::None => {
+                if push_oneshot_sw.is_low() {
+                    switch = Switch::PushToOneshots;
+                } else if play_oneshot_sw.is_low() {
+                    switch = Switch::PlayOneshot;
+                } else if cut_sw.is_low() {
+                    switch = Switch::PushToCuts { pad_index: None };
+                } else if seq_sw.is_low() {
+                    switch = Switch::PushToSequence;
+                } else {
+                    handle_step_sequence(prev_downs, downs.clone()).await;
+                }
+            },
+            Switch::PushToOneshots => {
+                if push_oneshot_sw.is_high() {
+                    switch = Switch::None;
+                    prev_filepath = None;
+                } else if let Some(ref filepaths) = filepaths {
+                    let filepath = filepath(lock_async_mut!(ADC).read(&mut fs_pin), filepaths.clone());
+                    if prev_filepath.clone().is_none() || prev_filepath.clone().is_some_and(|p| p != filepath) {
+                        defmt::info!("targeting filepath: {}", defmt::Debug2Format(&filepath));
+                        prev_filepath = Some(filepath.clone());
+                    }
 
-            if prev_downs != downs {
-                // assign steps of file to pad
-                if let Some(cut_idx) = cut_index {
-                    if let Some(&step_count) = downs.last() {
-                        let step_count = step_count + 1;
-
-                        match lock_async_mut!(STEPS).assign_pad(Some(file_index), Some(cut_idx), Some(step_count)).await {
-                            Err(audio::Error::StepOutOfBounds) => (),
-                            Err(e) => defmt::panic!("failed to assign pad: {}", Debug2Format(&e)),
-                            Ok(true) => (), // file exhausted
-                            _ => (),
+                    if downs.len() > prev_downs.len() {
+                        if let Some(down) = downs.last().map(|i| *i as usize) {
+                            let _ = STEPS_CHANNEL.send(Command::PushToOneshots { path: filepath, pad_index: down }).await;
                         }
-
-                        cut_index = None;
                     }
                 } else {
-                    cut_index = downs.last().copied();
-                    info!("target cut {}...", cut_index);
+                    let _ = STEPS_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
+                    filepaths = Some(PATHS_CHANNEL.receive().await);
                 }
-            }
-        } else if file_loaded {
-            cut_index = None;
-            file_loaded = false;
-            let _ = lock_async_mut!(STEPS).assign_pad(None, None, None).await;
-        } else if seq_sw.is_low() {
-            let downs = MTX.lock().await.borrow().clone();
-            if prev_downs != downs {
-                // build sequence
-                if let Some(pad_idx) = downs.last().copied() {
-                    seq.push(pad_idx);
-                    info!("add cut {} to sequence...", pad_idx);
+            },
+            Switch::PlayOneshot => {
+                if play_oneshot_sw.is_high() {
+                    switch = Switch::None;
+                } else if downs.len() > prev_downs.len() {
+                    if let Some(down) = downs.last().map(|i| *i as usize) {
+                        let _ = STEPS_CHANNEL.send(Command::PlayOneshot { pad_index: down }).await;
+                    }
                 }
-            }
-        } else if !seq.is_empty() {
-            // load sequence
-            info!("init load!");
-            let _ = lock_async_mut!(STEPS).buffer(audio::Event::Load { cuts: seq });
-            seq = Vec::new();
-        } else {
-            // step sequencing
-            handle_step_sequence(prev_downs, downs.clone()).await;
-        }
+            },
+            Switch::PushToCuts { ref mut pad_index } => {
+                if cut_sw.is_high() {
+                    switch = Switch::None;
+                    prev_filepath = None;
 
+                    let _ = STEPS_CHANNEL.send(Command::BakeCuts).await;
+                } else if let Some(ref filepaths) = filepaths {
+                    let filepath = filepath(lock_async_mut!(ADC).read(&mut fs_pin), filepaths.clone());
+                    if prev_filepath.clone().is_none() || prev_filepath.clone().is_some_and(|p| p != filepath) {
+                        defmt::info!("targeting filepath: {}", defmt::Debug2Format(&filepath));
+                        prev_filepath = Some(filepath.clone());
+                    }
+
+                    if downs.len() > prev_downs.len() {
+                        if let Some(down) = downs.last().map(|i| *i as usize) {
+                            if let Some(pad_index) = pad_index.take() {
+                                // assign steps of file to pad
+                                let step_count = down + 1;
+                                let _ = STEPS_CHANNEL.send(Command::PushToCuts { path: filepath, step_count, pad_index }).await;
+                            } else {
+                                // store pad_index for command on next down
+                                *pad_index = Some(down);
+                            }
+                        }
+                    }
+                } else {
+                    let _ = STEPS_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
+                    filepaths = Some(PATHS_CHANNEL.receive().await);
+                }
+            },
+            Switch::PushToSequence => {
+                if seq_sw.is_high() {
+                    switch = Switch::None;
+                    
+                    let _ = STEPS_CHANNEL.send(Command::BakeSequence).await;
+                } else if downs.len() > prev_downs.len() {
+                    if let Some(pad_index) = downs.last().map(|i| *i as usize) {
+                        let _ = STEPS_CHANNEL.send(Command::PushToSequence { pad_index }).await;
+                    }
+                }
+            },
+        }
         prev_downs = downs;
         Timer::after_millis(1).await;
+    }
+}
+
+async fn handle_step_sequence(
+    prev_downs: Vec<u8>,
+    downs: Vec<u8>,
+) {
+    static COUNT_CHANNEL: Channel<RawMutex, usize, 1> = Channel::new();
+
+    if prev_downs != downs {
+        let _ = STEPS_CHANNEL.send(Command::StepCount { sender: COUNT_CHANNEL.sender() }).await;
+        let step_count = COUNT_CHANNEL.receive().await;
+
+        match downs.first() {
+            Some(&step) if step_count > step as usize => {
+                if downs.len() > 1 {
+                    // init loop start
+                    let numerator = downs
+                        .iter()
+                        .skip(1)
+                        .map(|d| d.checked_sub(step + 1).unwrap_or(d + PAD_COUNT as u8- 1 - step))
+                        .fold(0u32, |acc, d| acc | 1 << d);
+                    let length = utils::Fraction::new(numerator, 16);
+
+                    let _ = STEPS_CHANNEL.send(Command::PushEvent {
+                        event: Event::Loop { step: step as usize, length }
+                    }).await;
+                } else if prev_downs.len() > 1 {
+                    // init loop stop
+                    let _ = STEPS_CHANNEL.send(Command::PushEvent {
+                        event: Event::Sync
+                    }).await;
+                } else {
+                    // init jump
+                    let _ = STEPS_CHANNEL.send(Command::PushEvent {
+                        event: Event::Hold { step: step as usize }
+                    }).await;
+                }
+            },
+            _ => {
+                // init sync
+                let _ = STEPS_CHANNEL.send(Command::PushEvent {
+                    event: Event::Sync
+                }).await;
+            }
+        }
     }
 }
 
@@ -381,9 +495,7 @@ async fn handle_joystick(
     joy_sw: gpio::Input<'static>,
 ) {
     let mut buf: RingBuf<(u16, u16), 16> = RingBuf::new();
-    // process state
     loop {
-        // handle joystick
         if joy_sw.is_low() {
             let x = lock_async_mut!(ADC).read(&mut x_pin);
             let y = lock_async_mut!(ADC).read(&mut y_pin);
@@ -399,29 +511,18 @@ async fn handle_joystick(
                         acc.1 + v.1 as f32 * (i + 1) as f32
                     ));
                 (
-                    x / (length * (length + 1) / 2) as f32,
-                    y / (length * (length + 1) / 2) as f32
+                    x / (length * (length + 1) / 2) as f32 / ADC_MAX as f32,
+                    y / (length * (length + 1) / 2) as f32 / ADC_MAX as f32,
                 )
             };
-            let bit_depth = (x + 4095.0) * (x - 4095.0) / 4095.0.powi(2) + 1.0;
-            let rate = (y + 4095.0) * (y - 4095.0) / 4095.0.powi(2) + 1.0;
-            lock_async_mut!(BITCRUSH).set_bit_depth(bit_depth);
-            lock_async_mut!(BITCRUSH).set_rate(rate);
+            let bit_depth = (x + 1.0) * (x - 1.0) + 1.0;
+            let rate = (y + 1.0) * (y - 1.0) + 1.0;
+            BITCRUSH.lock().await.set_bit_depth(bit_depth);
+            BITCRUSH.lock().await.set_rate(rate);
         }
 
         Timer::after_millis(1).await;
     }
-}
-
-#[embassy_executor::task]
-async fn read(sender: Sender<'static, RawMutex, Box<[u8]>, 1>) {
-    let mut grain = match lock_async_mut!(STEPS).read_grain().await {
-        Err(audio::Error::NoFileLoaded) => Box::new([u8::MAX / 2; 128]),
-        Err(e) => defmt::panic!("read err: {}", Debug2Format(&e)),
-        Ok(v) => v,
-    };
-    lock_async_ref!(BITCRUSH).crush(&mut grain);
-    sender.send(grain).await;
 }
 
 #[interrupt]
@@ -440,12 +541,8 @@ fn TIM4() {
         if CHANNEL.is_full() {
             *buffer = CHANNEL.try_receive().unwrap();
         }
-        let _ = SPAWNER.lock(|s| {
-            s
-                .borrow_mut()
-                .unwrap()
-                .spawn(read(CHANNEL.sender()))
-        });
+        let sender = CHANNEL.sender();
+        let _ = STEPS_CHANNEL.try_send(Command::ReadCut { sender });
     }
 
     let sample = buffer.get(*INDEX).copied().unwrap_or(u8::MAX / 2);
@@ -454,46 +551,8 @@ fn TIM4() {
     let duty = (sample as f32 / u8::MAX as f32 * pwm.get_max_duty() as f32) as u32;
 
     if let Err(e) = pwm.set_duty(embassy_stm32::timer::Channel::Ch3, duty) {
-        defmt::panic!("failed to set duty: {}", Debug2Format(&e));
+        defmt::panic!("failed to set duty: {}", defmt::Debug2Format(&e));
     }
 
     pwm.clear_update_interrupt();
-}
-
-async fn handle_step_sequence(
-    prev_downs: Vec<u8>,
-    mut downs: Vec<u8>,
-) {
-    let step_count = lock_async_ref!(STEPS).step_count().unwrap_or(0);
-    downs.retain(|&v| v < PAD_COUNT);
-    // process state
-    if prev_downs != downs {
-        match downs.first() {
-            Some(&step) if step < step_count => {
-                if downs.len() > 1 {
-                    // init loop start
-                    let numerator = downs
-                        .iter()
-                        .skip(1)
-                        .map(|v| v.checked_sub(step + 1).unwrap_or(v + PAD_COUNT - 1 - step))
-                        .fold(0u32, |acc, v| acc | 1 << v);
-
-                    info!("numerator: {}, downs: {}", numerator, Debug2Format(&downs));
-                    let length = utils::Fraction::new(numerator, 16);
-
-                    let _ = lock_async_mut!(STEPS).buffer(audio::Event::Loop { step: step as u32, length });
-                } else if prev_downs.len() > 1 {
-                    // init loop stop
-                    let _ = lock_async_mut!(STEPS).buffer(audio::Event::Sync);
-                } else {
-                    // init jump
-                    let _ = lock_async_mut!(STEPS).buffer(audio::Event::Hold { step: step as u32 });
-                }
-            },
-            _ => {
-                // init sync
-                let _ = lock_async_mut!(STEPS).buffer(audio::Event::Sync);
-            },
-        }
-    }
 }

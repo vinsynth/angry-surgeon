@@ -9,7 +9,7 @@ pub struct Bitcrush {
 }
 
 impl Bitcrush {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { bit_depth: 1.0, rate: 1.0 }
     }
 

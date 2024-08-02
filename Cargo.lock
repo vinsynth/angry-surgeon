@@ -3,10 +3,22 @@
 version = 3
 
 [[package]]
+name = "aligned"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "377e4c0ba83e4431b10df45c1d4666f178ea9c552cac93e60c3a88bf32785923"
+dependencies = [
+ "as-slice",
+]
+
+[[package]]
 name = "angry-surgeon"
 version = "0.1.0"
 dependencies = [
+ "aligned",
  "arraydeque",
+ "block-device-adapters",
+ "block-device-driver",
  "cortex-m",
  "cortex-m-rt",
  "defmt",
@@ -16,7 +28,8 @@ dependencies = [
  "embassy-sync",
  "embassy-time",
  "embedded-alloc",
- "embedded-sdmmc",
+ "embedded-fatfs",
+ "embedded-io-async",
  "microfft",
  "micromath",
  "panic-probe",
@@ -27,6 +40,15 @@ name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
+name = "as-slice"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "516b6b4f0e40d50dcda9365d53964ec74560ad4284da2e7fc97122cd83174516"
+dependencies = [
+ "stable_deref_trait",
+]
 
 [[package]]
 name = "autocfg"
@@ -66,6 +88,24 @@ name = "bitflags"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf4b9d6a944f767f8e5e0db018570623c85f3d925ac718db4e06d0187adb21c1"
+
+[[package]]
+name = "block-device-adapters"
+version = "0.1.0"
+source = "git+https://github.com/MabezDev/embedded-fatfs#46a39fd4dba9e5efe5931e0da67478475129ad13"
+dependencies = [
+ "aligned",
+ "block-device-driver",
+ "embedded-io-async",
+]
+
+[[package]]
+name = "block-device-driver"
+version = "0.2.0"
+source = "git+https://github.com/MabezDev/embedded-fatfs#46a39fd4dba9e5efe5931e0da67478475129ad13"
+dependencies = [
+ "aligned",
+]
 
 [[package]]
 name = "byteorder"
@@ -394,6 +434,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-fatfs"
+version = "0.1.0"
+dependencies = [
+ "bitflags 1.3.2",
+ "defmt",
+ "embedded-io-async",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -445,17 +494,6 @@ checksum = "3ff09972d4073aa8c299395be75161d582e7629cd663171d62af73c8d50dba3f"
 dependencies = [
  "defmt",
  "embedded-io",
-]
-
-[[package]]
-name = "embedded-sdmmc"
-version = "0.7.0"
-dependencies = [
- "byteorder",
- "defmt",
- "embedded-hal 1.0.0",
- "embedded-hal-async",
- "heapless",
 ]
 
 [[package]]

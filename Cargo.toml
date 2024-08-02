@@ -11,11 +11,25 @@ defmt = "0.3.6"
 defmt-rtt = "0.4.0"
 panic-probe = "0.3.1"
 
+aligned = "0.4.2"
 arraydeque = { version = "0.5.1", default-features = false }
 embedded-alloc = "0.5.1"
-embedded-sdmmc = { path = "../embedded-sdmmc-rs", features = ["defmt-log"], default-features = false }
+embedded-io-async = "0.6.1"
 microfft = "0.6.0"
 micromath = { version = "2.1.0", features = ["num-traits"] }
+
+[dependencies.embedded-fatfs]
+path = "../embedded-fatfs/embedded-fatfs"
+features = ["defmt", "lfn"]
+default-features = false
+
+[dependencies.block-device-adapters]
+git = "https://github.com/MabezDev/embedded-fatfs"
+default-features = false
+
+[dependencies.block-device-driver]
+git = "https://github.com/MabezDev/embedded-fatfs"
+default-features = false
 
 [dependencies.embassy-stm32]
 git = "https://github.com/embassy-rs/embassy"

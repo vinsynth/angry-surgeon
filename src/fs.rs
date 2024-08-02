@@ -1,110 +1,108 @@
-use core::result::Result;
-
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::mutex::Mutex;
+use block_device_adapters::{BufStream, BufStreamError, StreamSlice, StreamSliceError};
+use block_device_driver::BlockDevice;
+use embedded_io_async::{Read, Seek, SeekFrom};
 
 use embassy_stm32::sdmmc::{DataBlock, Instance, Sdmmc, SdmmcDma};
 use embassy_stm32::sdmmc::Error as SdmmcError;
 
-use embedded_sdmmc::{Block, BlockDevice, BlockIdx, Timestamp, BlockCount};
+#[derive(Debug)]
+pub enum SdioCardError {
+    ReadExact(embedded_io_async::ReadExactError<BufStreamError<SdmmcError>>),
+    StreamSlice(StreamSliceError<BufStreamError<SdmmcError>>),
+}
+
+impl From<BufStreamError<SdmmcError>> for SdioCardError {
+    fn from(value: BufStreamError<SdmmcError>) -> Self {
+        Self::StreamSlice(StreamSliceError::from(value))
+    }
+}
+impl From<embedded_io_async::ReadExactError<BufStreamError<SdmmcError>>> for SdioCardError {
+    fn from(value: embedded_io_async::ReadExactError<BufStreamError<SdmmcError>>) -> Self {
+        Self::ReadExact(value)
+    }
+}
+impl From<StreamSliceError<BufStreamError<SdmmcError>>> for SdioCardError {
+    fn from(value: StreamSliceError<BufStreamError<SdmmcError>>) -> Self {
+        Self::StreamSlice(value)
+    }
+}
 
 pub struct SdioCard<'a, T: Instance, D: SdmmcDma<T>> {
-    inner: Mutex<CriticalSectionRawMutex, SdioCardInner<'a, T, D>>
+    sdmmc: Sdmmc<'a, T, D>,
 }
 
 impl<'a, T: Instance, D: SdmmcDma<T>> SdioCard<'a, T, D> {
     pub fn new(sdmmc: Sdmmc<'a, T, D>) -> Self {
-        Self { inner: Mutex::new(SdioCardInner { sdmmc }) }
+        Self { sdmmc }
     }
 
-    pub async fn num_bytes(&self) -> Result<u64, SdmmcError> {
-        self.inner.lock().await.sdmmc.card().map(|c| c.size())
+    pub async fn into_stream_slice(self) -> Result<StreamSlice<BufStream<SdioCard<'a, T, D>, 512>>, SdioCardError> {
+        let mut stream = BufStream::new(self);
+
+        let mut buf = [0u8; 8];
+        // assume LBA block/sector size = 512 bytes
+        let _ = stream.seek(SeekFrom::Start(512 + 0x48)).await?;
+        stream.read_exact(&mut buf).await?;
+        let partition_array_lba = u64::from_le_bytes(buf);
+
+        let _ = stream
+            .seek(SeekFrom::Start(partition_array_lba * 512 + 0x20))
+            .await?;
+        stream.read_exact(&mut buf).await?;
+        let partition_lba_first = u64::from_le_bytes(buf);
+        stream.read_exact(&mut buf).await?;
+        let partition_lba_last = u64::from_le_bytes(buf); // inclusive
+
+        stream.rewind().await?;
+
+        Ok(StreamSlice::new(
+            stream,
+            partition_lba_first * 512,
+            (partition_lba_last + 1) * 512, // exclusive
+        ).await?)
     }
 }
 
-impl<'a, T: Instance, D: SdmmcDma<T>> BlockDevice for SdioCard<'a, T, D> {
+impl <'a, T: Instance, D: SdmmcDma<T>> BlockDevice<512> for SdioCard<'a, T, D> {
     type Error = SdmmcError;
+    type Align = aligned::A4;
 
-    async fn read(
-        &self,
-        blocks: &mut [Block],
-        start_block_idx: BlockIdx,
-        _reason: &str,
-    ) -> Result<(), Self::Error> {
-        self.inner.lock().await.read(blocks, start_block_idx).await
-    }
-
-    async fn write(
-        &self,
-        blocks: &[Block],
-        start_block_idx: BlockIdx,
-    ) -> Result<(), Self::Error> {
-        self.inner.lock().await.write(blocks, start_block_idx).await
-    }
-
-    async fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
-        self.inner.lock().await.sdmmc.card().map(|c| BlockCount(c.csd.block_count()))
-    }
-
-    async fn reset(&self) -> Result<(), Self::Error> {
-        let mut inner = self.inner.lock().await;
-
-        let freq = inner.sdmmc.clock();
-        inner.sdmmc.init_card(freq).await
-    }
-}
-
-pub struct SdioCardInner<'a, T: Instance, D: SdmmcDma<T>> {
-    sdmmc: Sdmmc<'a, T, D>,
-}
-
-impl<'a, T: Instance, D: SdmmcDma<T>> SdioCardInner<'a, T, D> {
     async fn read(
         &mut self,
-        blocks: &mut [Block],
-        start_block_idx: BlockIdx,
-    ) -> Result<(), SdmmcError> {
-        for block in blocks.iter_mut() {
-            let mut buf = DataBlock(block.contents);
-            // let mut buf = DataBlock([0; 512]);
+        mut block_address: u32,
+        data: &mut [aligned::Aligned<Self::Align, [u8; 512]>],
+    ) -> Result<(), Self::Error> {
+        for block in data.iter_mut() {
+            let mut buf = DataBlock(**block);
 
             self.sdmmc.read_block(
-                start_block_idx.0,
-                &mut buf
+                block_address,
+                &mut buf,
             ).await?;
 
-            block.contents = buf.0;
+            **block = buf.0;
+            block_address += block.len() as u32;
         }
         Ok(())
     }
 
     async fn write(
         &mut self,
-        blocks: &[Block],
-        start_block_idx: BlockIdx,
-    ) -> Result<(), SdmmcError> {
-        for block in blocks.iter() {
+        mut block_address: u32,
+        data: &[aligned::Aligned<Self::Align, [u8; 512]>],
+    ) -> Result<(), Self::Error> {
+        for block in data.iter() {
             self.sdmmc.write_block(
-                start_block_idx.0,
-                &DataBlock(block.contents)
+                block_address,
+                &DataBlock(**block),
             ).await?;
+
+            block_address += block.len() as u32;
         }
         Ok(())
     }
-}
 
-#[derive(Default)]
-pub struct DummyTimesource();
-
-impl embedded_sdmmc::filesystem::TimeSource for DummyTimesource {
-    fn get_timestamp(&self) -> Timestamp {
-        Timestamp {
-            year_since_1970: 0,
-            zero_indexed_month: 0,
-            zero_indexed_day: 0,
-            hours: 0,
-            minutes: 0,
-            seconds: 0,
-        }
+    async fn size(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.sdmmc.card()?.size())
     }
 }

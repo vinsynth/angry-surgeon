@@ -8,6 +8,7 @@ mod utils;
 
 use audio::fx::Bitcrush;
 use audio::steps::{Command, Event, Steps};
+use embassy_stm32::exti::ExtiInput;
 use fs::SdioCard;
 use pwm::InterruptPwm;
 use utils::AsyncMutex;
@@ -45,7 +46,7 @@ static MTX: AsyncMutex<RefCell<Vec<u8>>> = AsyncMutex::new(RefCell::new(Vec::new
 static PWM: SyncMutex<RefCell<Option<InterruptPwm<TIM4>>>> = SyncMutex::new(RefCell::new(None));
 static BITCRUSH: AsyncMutex<Bitcrush> = AsyncMutex::new(Bitcrush::new());
 
-static STEPS_CHANNEL: Channel<RawMutex, Command, 1> = Channel::new();
+static COMMAND_CHANNEL: Channel<RawMutex, Command, 1> = Channel::new();
 
 embassy_stm32::bind_interrupts!(struct Irqs {
     SDIO => sdmmc::InterruptHandler<embassy_stm32::peripherals::SDIO>;
@@ -190,6 +191,10 @@ async fn main(spawner: Spawner) {
     let cut_sw = new_input!(p.PB14);
     let seq_sw = new_input!(p.PB12);
 
+    let _ = spawner.spawn(handle_recording(
+        ExtiInput::new(p.PA0, p.EXTI0, gpio::Pull::Up)
+    ));
+
     let _ = spawner.spawn(handle_pads(
         p.PA4,
         oneshot_push_sw,
@@ -210,10 +215,22 @@ async fn main(spawner: Spawner) {
         use block_device_adapters::StreamSliceError;
         use embedded_fatfs::Error;
 
-        let command = STEPS_CHANNEL.receive().await;
+        let command = COMMAND_CHANNEL.receive().await;
         match command {
+            Command::RecordEvents => {
+                steps.record_events();
+                defmt::info!("started recording!");
+            },
+            Command::BakeRecording => {
+                steps.bake_recording();
+                defmt::info!("baked recording!");
+            },
             Command::PushEvent { event } => {
-                steps.push_event(event);
+                match steps.push_event(event).await {
+                    Err(StreamSliceError::Other(Error::NotFound)) => (),
+                    Err(e) => defmt::panic!("failed to push event: {}", defmt::Debug2Format(&e)),
+                    _ => (),
+                };
                 defmt::info!("pushed event {}!", event);
             },
             Command::PushToOneshots { path, pad_index } => {
@@ -312,6 +329,25 @@ async fn handle_matrix(
 }
 
 #[embassy_executor::task]
+async fn handle_recording (
+    mut sw: ExtiInput<'static>,
+) {
+    loop {
+        sw.wait_for_falling_edge().await;
+        COMMAND_CHANNEL.send(Command::RecordEvents).await;
+        Timer::after_millis(17).await;
+        sw.wait_for_rising_edge().await;
+        Timer::after_millis(17).await;
+
+        sw.wait_for_falling_edge().await;
+        COMMAND_CHANNEL.send(Command::BakeRecording).await;
+        Timer::after_millis(17).await;
+        sw.wait_for_rising_edge().await;
+        Timer::after_millis(17).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn handle_pads (
     mut fs_pin: impl embassy_stm32::adc::AdcPin<ADC1> + 'static,
     push_oneshot_sw: gpio::Input<'static>,
@@ -322,7 +358,7 @@ async fn handle_pads (
     enum Switch {
         None,
         PushToOneshots,
-        PlayOneshot,
+        PlayOneshot { played: bool },
         PushToCuts { pad_index: Option<usize> },
         PushToSequence,
     }
@@ -356,7 +392,7 @@ async fn handle_pads (
                 if push_oneshot_sw.is_low() {
                     switch = Switch::PushToOneshots;
                 } else if play_oneshot_sw.is_low() {
-                    switch = Switch::PlayOneshot;
+                    switch = Switch::PlayOneshot { played: false };
                 } else if cut_sw.is_low() {
                     switch = Switch::PushToCuts { pad_index: None };
                 } else if seq_sw.is_low() {
@@ -378,20 +414,24 @@ async fn handle_pads (
 
                     if downs.len() > prev_downs.len() {
                         if let Some(down) = downs.last().map(|i| *i as usize) {
-                            let _ = STEPS_CHANNEL.send(Command::PushToOneshots { path: filepath, pad_index: down }).await;
+                            let _ = COMMAND_CHANNEL.send(Command::PushToOneshots { path: filepath, pad_index: down }).await;
                         }
                     }
                 } else {
-                    let _ = STEPS_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
+                    let _ = COMMAND_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
                     filepaths = Some(PATHS_CHANNEL.receive().await);
                 }
             },
-            Switch::PlayOneshot => {
+            Switch::PlayOneshot {ref mut played }=> {
                 if play_oneshot_sw.is_high() {
+                    if !*played {
+                        let _ = COMMAND_CHANNEL.send(Command::PlayOneshot { pad_index: None }).await;
+                    }
                     switch = Switch::None;
                 } else if downs.len() > prev_downs.len() {
                     if let Some(down) = downs.last().map(|i| *i as usize) {
-                        let _ = STEPS_CHANNEL.send(Command::PlayOneshot { pad_index: down }).await;
+                        *played = true;
+                        let _ = COMMAND_CHANNEL.send(Command::PlayOneshot { pad_index: Some(down) }).await;
                     }
                 }
             },
@@ -400,7 +440,7 @@ async fn handle_pads (
                     switch = Switch::None;
                     prev_filepath = None;
 
-                    let _ = STEPS_CHANNEL.send(Command::BakeCuts).await;
+                    let _ = COMMAND_CHANNEL.send(Command::BakeCuts).await;
                 } else if let Some(ref filepaths) = filepaths {
                     let filepath = filepath(lock_async_mut!(ADC).read(&mut fs_pin), filepaths.clone());
                     if prev_filepath.clone().is_none() || prev_filepath.clone().is_some_and(|p| p != filepath) {
@@ -413,7 +453,7 @@ async fn handle_pads (
                             if let Some(pad_index) = pad_index.take() {
                                 // assign steps of file to pad
                                 let step_count = down + 1;
-                                let _ = STEPS_CHANNEL.send(Command::PushToCuts { path: filepath, step_count, pad_index }).await;
+                                let _ = COMMAND_CHANNEL.send(Command::PushToCuts { path: filepath, step_count, pad_index }).await;
                             } else {
                                 // store pad_index for command on next down
                                 *pad_index = Some(down);
@@ -421,7 +461,7 @@ async fn handle_pads (
                         }
                     }
                 } else {
-                    let _ = STEPS_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
+                    let _ = COMMAND_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
                     filepaths = Some(PATHS_CHANNEL.receive().await);
                 }
             },
@@ -429,10 +469,10 @@ async fn handle_pads (
                 if seq_sw.is_high() {
                     switch = Switch::None;
                     
-                    let _ = STEPS_CHANNEL.send(Command::BakeSequence).await;
+                    let _ = COMMAND_CHANNEL.send(Command::BakeSequence).await;
                 } else if downs.len() > prev_downs.len() {
                     if let Some(pad_index) = downs.last().map(|i| *i as usize) {
-                        let _ = STEPS_CHANNEL.send(Command::PushToSequence { pad_index }).await;
+                        let _ = COMMAND_CHANNEL.send(Command::PushToSequence { pad_index }).await;
                     }
                 }
             },
@@ -449,7 +489,7 @@ async fn handle_step_sequence(
     static COUNT_CHANNEL: Channel<RawMutex, usize, 1> = Channel::new();
 
     if prev_downs != downs {
-        let _ = STEPS_CHANNEL.send(Command::StepCount { sender: COUNT_CHANNEL.sender() }).await;
+        let _ = COMMAND_CHANNEL.send(Command::StepCount { sender: COUNT_CHANNEL.sender() }).await;
         let step_count = COUNT_CHANNEL.receive().await;
 
         match downs.first() {
@@ -463,24 +503,24 @@ async fn handle_step_sequence(
                         .fold(0u32, |acc, d| acc | 1 << d);
                     let length = utils::Fraction::new(numerator, 16);
 
-                    let _ = STEPS_CHANNEL.send(Command::PushEvent {
+                    let _ = COMMAND_CHANNEL.send(Command::PushEvent {
                         event: Event::Loop { step: step as usize, length }
                     }).await;
                 } else if prev_downs.len() > 1 {
                     // init loop stop
-                    let _ = STEPS_CHANNEL.send(Command::PushEvent {
+                    let _ = COMMAND_CHANNEL.send(Command::PushEvent {
                         event: Event::Sync
                     }).await;
                 } else {
                     // init jump
-                    let _ = STEPS_CHANNEL.send(Command::PushEvent {
+                    let _ = COMMAND_CHANNEL.send(Command::PushEvent {
                         event: Event::Hold { step: step as usize }
                     }).await;
                 }
             },
             _ => {
                 // init sync
-                let _ = STEPS_CHANNEL.send(Command::PushEvent {
+                let _ = COMMAND_CHANNEL.send(Command::PushEvent {
                     event: Event::Sync
                 }).await;
             }
@@ -542,7 +582,7 @@ fn TIM4() {
             *buffer = CHANNEL.try_receive().unwrap();
         }
         let sender = CHANNEL.sender();
-        let _ = STEPS_CHANNEL.try_send(Command::ReadCut { sender });
+        let _ = COMMAND_CHANNEL.try_send(Command::ReadCut { sender });
     }
 
     let sample = buffer.get(*INDEX).copied().unwrap_or(u8::MAX / 2);

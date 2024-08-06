@@ -1,6 +1,7 @@
 use crate::utils::Fraction;
 use super::rhythm::RhythmData;
 
+use alloc::collections::VecDeque;
 use alloc::{format, vec};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -17,9 +18,11 @@ use embassy_sync::channel::Sender;
 pub type StepsSender<'a, T, const N: usize> = Sender<'a, RawMutex, T, N>;
 
 pub enum Command<'a> {
+    RecordEvents,
+    BakeRecording,
     PushEvent { event: Event },
     PushToOneshots { path: String, pad_index: usize },
-    PlayOneshot { pad_index: usize },
+    PlayOneshot { pad_index: Option<usize> },
     PushToCuts { path: String, step_count: usize, pad_index: usize },
     BakeCuts,
     PushToSequence { pad_index: usize },
@@ -46,6 +49,84 @@ enum Desync {
 enum State {
     Sync,
     Desync { inner: Desync, seq_index: usize, sync_step: f32 },
+}
+
+#[derive(PartialEq)]
+enum LogState {
+    Record,
+    Recall { active: bool },
+}
+
+#[derive(Clone, Debug)]
+struct LoggedEvent {
+    event: Event,
+    call_step: f32,
+}
+
+struct EventLog {
+    pub state: LogState,
+    seqs: VecDeque<Vec<LoggedEvent>>,
+    seqs_index: usize,
+}
+
+impl EventLog {
+    pub fn new() -> Self {
+        Self {
+            state: LogState::Record,
+            seqs: VecDeque::from(vec![Vec::new()]),
+            seqs_index: 0,
+        }
+    }
+
+    pub fn advance_seq(&mut self) {
+        if self.state == LogState::Record {
+            self.seqs.push_back(Vec::new());
+        } else {
+            self.seqs_index += 1;
+            self.seqs_index %= self.seqs.len();
+        }
+        defmt::info!("seqs: {}", defmt::Debug2Format(&self.seqs));
+    }
+
+    pub fn try_push(&mut self, step_offset: f32, event: Event) {
+        if self.state == LogState::Record {
+            if let Some(seq) = self.seqs.back_mut() {
+                seq.push(LoggedEvent {
+                    event,
+                    call_step: step_offset,
+                });
+            }
+        }
+    }
+
+    pub fn try_pop(&mut self, step_offset: f32) -> Option<Event> {
+        if matches!(self.state, LogState::Recall { active: true }) {
+            return self.seqs.get_mut(self.seqs_index).and_then(|e| {
+                e
+                    .iter()
+                    .rfind(|e| {
+                        e.call_step > step_offset - 1.0 / 16.0
+                            && e.call_step < step_offset
+                    })
+                    .map(|e| e.event)
+            });
+        }
+        None
+    }
+
+    pub fn bake(&mut self) {
+        // compact sequences starting on pickup
+        let start_step = self.seqs.front().and_then(|s| s.first().map(|e| e.call_step));
+        let end_step = self.seqs.back().and_then(|s| s.last().map(|e| e.call_step));
+        if start_step.is_some_and(|s| end_step.is_some_and(|e| e < s))
+            && self.seqs.len() > 1
+        {
+            let first = self.seqs.pop_front().unwrap();
+            self.seqs.back_mut().unwrap().extend_from_slice(&first);
+        }
+        self.seqs_index = self.seqs.len() - 1;
+        self.state = LogState::Recall { active: true };
+    }
 }
 
 struct SequenceBuilder {
@@ -139,6 +220,7 @@ pub struct Steps<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> {
     oneshot_index: Option<usize>,
     state: State,
     event_buf: Option<Event>,
+    event_log: Option<EventLog>,
     led: embassy_stm32::gpio::Output<'a>,
 }
 
@@ -165,6 +247,11 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
     }
 
     pub async fn new(mut led: embassy_stm32::gpio::Output<'a>, root: Dir<'a, IO, TP, OCC>) -> Result<Self, Error<IO::Error>> {
+        for _ in 0..4 {
+            led.toggle();
+            embassy_time::Timer::after_millis(100).await;
+        }
+
         let paths = Self::paths_recursive(&root).await?;
         defmt::info!("paths: {}", defmt::Debug2Format(&paths));
 
@@ -205,12 +292,62 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
             oneshot_index: None,
             state: State::Sync,
             event_buf: None,
+            event_log: None,
             led,
         })
     }
 
-    pub fn push_event(&mut self, event: Event) {
+    pub async fn push_event(&mut self, event: Event) -> Result<(), StreamSliceError<Error<IO::Error>>> {
         self.event_buf = Some(event);
+        let step_offset = match self.state {
+            State::Desync { sync_step, .. } => sync_step,
+            _ => self.seq_step_offset().await?,
+        };
+        if let Some(event_log) = self.event_log.as_mut() {
+            event_log.try_push(step_offset, event);
+
+            if let LogState::Recall { ref mut active } = event_log.state {
+                *active = matches!(event, Event::Sync);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn recall_event(&mut self) -> Result<(), StreamSliceError<Error<IO::Error>>> {
+        let step_offset = match self.state {
+            State::Desync { sync_step, .. } => sync_step,
+            _ => self.seq_step_offset().await?,
+        };
+        if let Some(event_log) = self.event_log.as_mut() {
+            // advance recording on synced sequence loop
+            if step_offset < 1.0 / 16.0 {
+                event_log.advance_seq();
+            }
+            // recall event recording
+            if self.event_buf.is_none() {
+                self.event_buf = event_log.try_pop(step_offset);
+                if let Some(event) = self.event_buf {
+                    defmt::info!("step: {} | event: {}", step_offset, event);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_events(&mut self) {
+        self.event_log = Some(EventLog::new());
+    }
+
+    pub fn bake_recording(&mut self) {
+        if let Some(event_log) = self.event_log.as_mut() {
+            event_log.bake();
+        }
+        if self.event_log.as_ref().is_some_and(|e| {
+            e.seqs.iter().all(|s| s.is_empty())
+        }) {
+            self.event_log = None;
+        }
     }
 
     pub async fn push_to_oneshots(&mut self, path: String, pad_index: usize) -> Result<(), StreamSliceError<Error<IO::Error>>> {
@@ -224,12 +361,16 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
         Ok(())
     }
 
-    pub async fn play_oneshot(&mut self, pad_index: usize) -> Result<(), StreamSliceError<Error<IO::Error>>> {
-        if pad_index < self.oneshots.len() {
-            self.oneshot_index = Some(pad_index);
-            if let Some(Some(oneshot)) = self.oneshots.get_mut(pad_index) {
-                oneshot.rewind().await?;
+    pub async fn play_oneshot(&mut self, pad_index: Option<usize>) -> Result<(), StreamSliceError<Error<IO::Error>>> {
+        if let Some(pad_index) = pad_index {
+            if pad_index < self.oneshots.len() {
+                self.oneshot_index = Some(pad_index);
+                if let Some(Some(oneshot)) = self.oneshots.get_mut(pad_index) {
+                    oneshot.rewind().await?;
+                }
             }
+        } else {
+            self.oneshot_index = None;
         }
         Ok(())
     }
@@ -306,11 +447,11 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
             .into_iter()
             .filter(|&i| i < self.cuts.len())
             .collect::<Vec<_>>();
-
         self.seq = pad_indices;
 
         self.state = State::Sync;
         self.event_buf = None;
+
         defmt::info!("loaded sequence {}!", defmt::Debug2Format(&self.seq));
 
         if self.cut_ref().is_none() {
@@ -331,6 +472,11 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
 
     /// read grain of current cut(s) in sequence
     pub async fn read_cut(&mut self) -> Result<Box<[u8]>, StreamSliceError<Error<IO::Error>>> {
+        // handle event recording
+        if self.event_log.is_some() {
+            self.recall_event().await?;
+        }
+
         // handle state
         if self.is_quantum().await? {
             self.led.toggle();
@@ -340,7 +486,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
             if let State::Desync {
                 inner: Desync::Loop { step, length }, seq_index, ..
             } = self.state {
-                let step_offset = self.step_offset().await?;
+                let step_offset = self.seq_step_offset().await?;
                 let step_count = self.steps_until_seq_index(self.seq.len()).ok_or(Error::NotFound)? as f32;
 
                 let start = (self.steps_until_seq_index(seq_index).ok_or(Error::NotFound)? + step) as f32;
@@ -457,7 +603,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
                     let (seq_index, sync_step) = match self.state {
                         State::Desync { seq_index, sync_step, .. } => (seq_index, sync_step),
                         _ => {
-                            let sync_step = self.step_offset().await?;
+                            let sync_step = self.seq_step_offset().await?;
 
                             let offset = (step as f32 * self.step_len().ok_or(Error::NotFound)? as f32) as u64;
                             self.cut_mut().ok_or(Error::NotFound)?.slice.seek(SeekFrom::Start(offset)).await?;
@@ -472,7 +618,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
                     let (seq_index, sync_step) = match self.state {
                         State::Desync { seq_index, sync_step, .. } => (seq_index, sync_step),
                         _ => {
-                            let sync_step = self.step_offset().await?;
+                            let sync_step = self.seq_step_offset().await?;
                             (self.seq_index, sync_step)
                         },
                     };
@@ -526,7 +672,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
         None
     }
 
-    async fn step_offset(&mut self) -> Result<f32, StreamSliceError<Error<IO::Error>>> {
+    async fn seq_step_offset(&mut self) -> Result<f32, StreamSliceError<Error<IO::Error>>> {
         Ok(
             self.steps_until_seq_index(self.seq_index).ok_or(Error::NotFound)? as f32
                 + self.cut_mut().ok_or(Error::NotFound)?.slice.stream_position().await? as f32

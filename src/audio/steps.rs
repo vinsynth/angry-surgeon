@@ -18,6 +18,7 @@ use embassy_sync::channel::Sender;
 pub type StepsSender<'a, T, const N: usize> = Sender<'a, RawMutex, T, N>;
 
 pub enum Command<'a> {
+    SetTempo { tempo: f32 },
     RecordEvents,
     BakeRecording,
     PushEvent { event: Event },
@@ -230,9 +231,11 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
         let mut iter = dir.iter();
         while let Some(entry) = iter.next().await {
             let entry = entry?;
-            if !entry.attributes().contains(embedded_fatfs::FileAttributes::HIDDEN) {
-                let ucs2 = entry.long_file_name_as_ucs2_units();
-                if let Some(Ok(name)) = ucs2.map(alloc::string::String::from_utf16) {
+            let ucs2 = entry.long_file_name_as_ucs2_units();
+            if let Some(Ok(name)) = ucs2.map(alloc::string::String::from_utf16) {
+                if !entry.attributes().contains(embedded_fatfs::FileAttributes::HIDDEN)
+                    && !name.starts_with(".")
+                {
                     if entry.is_dir() {
                         let grandchildren = Box::pin(Self::paths_recursive(&dir.open_dir(&name).await?)).await?;
                         for grandchild in grandchildren {
@@ -295,6 +298,11 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
             event_log: None,
             led,
         })
+    }
+
+    pub fn set_tempo(&mut self, tempo: f32) -> Result<(), Error<IO::Error>> {
+        self.anchor_tempo = Some(tempo);
+        self.sync_tempo()
     }
 
     pub async fn push_event(&mut self, event: Event) -> Result<(), StreamSliceError<Error<IO::Error>>> {

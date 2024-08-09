@@ -36,12 +36,13 @@ use embassy_stm32::{gpio, interrupt, sdmmc};
 use embassy_stm32::peripherals::{ADC1, TIM4};
 use embassy_stm32::time::Hertz;
 
-const PAD_COUNT: usize = 8;
+const PAD_COUNT: usize = 12;
 const ADC_MAX: u16 = 4095;
 
 type RingBuf<T, const CAP: usize> = arraydeque::ArrayDeque<T, CAP, arraydeque::Wrapping>;
 
 static ADC: AsyncMutex<Option<embassy_stm32::adc::Adc<ADC1>>> = AsyncMutex::new(None);
+static POT_PIN: AsyncMutex<Option<embassy_stm32::peripherals::PA4>> = AsyncMutex::new(None);
 static MTX: AsyncMutex<RefCell<Vec<u8>>> = AsyncMutex::new(RefCell::new(Vec::new()));
 static PWM: SyncMutex<RefCell<Option<InterruptPwm<TIM4>>>> = SyncMutex::new(RefCell::new(None));
 static BITCRUSH: AsyncMutex<Bitcrush> = AsyncMutex::new(Bitcrush::new());
@@ -181,26 +182,21 @@ async fn main(spawner: Spawner) {
         [mx_output0, mx_output1, mx_output2, mx_output3],
     ));
 
-    defmt::info!("init adc...");
-    let adc = embassy_stm32::adc::Adc::new(p.ADC1);
-
-    ADC.lock().await.replace(adc);
-
-    let oneshot_push_sw = new_input!(p.PB10);
-    let oneshot_play_sw = new_input!(p.PB0);
-    let cut_sw = new_input!(p.PB14);
-    let seq_sw = new_input!(p.PB12);
-
     let _ = spawner.spawn(handle_recording(
         ExtiInput::new(p.PA0, p.EXTI0, gpio::Pull::Up)
     ));
 
+    defmt::info!("init adc...");
+    let adc = embassy_stm32::adc::Adc::new(p.ADC1);
+    ADC.lock().await.replace(adc);
+    POT_PIN.lock().await.replace(p.PA4);
+
+    let _ = spawner.spawn(handle_tempo(new_input!(p.PB0)));
+
     let _ = spawner.spawn(handle_pads(
-        p.PA4,
-        oneshot_push_sw,
-        oneshot_play_sw,
-        cut_sw,
-        seq_sw,
+        new_input!(p.PB14),
+        new_input!(p.PB12),
+        new_input!(p.PB10),
     ));
 
     let _ = spawner.spawn(handle_joystick(
@@ -217,6 +213,9 @@ async fn main(spawner: Spawner) {
 
         let command = COMMAND_CHANNEL.receive().await;
         match command {
+            Command::SetTempo { tempo } => {
+                let _ = steps.set_tempo(tempo);
+            },
             Command::RecordEvents => {
                 steps.record_events();
                 defmt::info!("started recording!");
@@ -348,19 +347,41 @@ async fn handle_recording (
 }
 
 #[embassy_executor::task]
+async fn handle_tempo (
+    sw: gpio::Input<'static>,
+) {
+    let mut adc_buf: RingBuf<u16, 16> = RingBuf::new();
+
+    loop {
+        if sw.is_low() {
+        let length = adc_buf.len();
+        adc_buf.push_back(lock_async_mut!(ADC).read(lock_async_mut!(POT_PIN)));
+            let wma = adc_buf
+                .iter()
+                .enumerate()
+                .fold(0.0, |acc, (i, &v)| {
+                    acc + v as f32 * (i + 1) as f32
+                }) / (length * (length + 1) / 2) as f32;
+            let tempo = wma / ADC_MAX as f32 * 540.0 + 60.0;
+            let _ = COMMAND_CHANNEL.send(Command::SetTempo { tempo }).await;
+        } else {
+            adc_buf.clear();
+        }
+        embassy_time::Timer::after_millis(1).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn handle_pads (
-    mut fs_pin: impl embassy_stm32::adc::AdcPin<ADC1> + 'static,
-    push_oneshot_sw: gpio::Input<'static>,
-    play_oneshot_sw: gpio::Input<'static>,
-    cut_sw: gpio::Input<'static>,
+    push_file_sw: gpio::Input<'static>,
     seq_sw: gpio::Input<'static>,
+    play_oneshot_sw: gpio::Input<'static>,
 ) {
     enum Switch {
         None,
-        PushToOneshots,
-        PlayOneshot { played: bool },
-        PushToCuts { pad_index: Option<usize> },
+        PushFile { pad_index: Option<usize> },
         PushToSequence,
+        PlayOneshot { played: bool },
     }
     let mut switch = Switch::None;
 
@@ -369,7 +390,7 @@ async fn handle_pads (
     let mut prev_filepath = None;
 
     let mut adc_buf: RingBuf<u16, 16> = RingBuf::new();
-    let mut filepath = |adc: u16, filepaths: Vec<String>| {
+    let filepath = |adc_buf: &mut RingBuf<u16, 16>, adc: u16, filepaths: Vec<String>| {
         adc_buf.push_back(adc);
         let length = adc_buf.len();
         let wma = adc_buf
@@ -389,60 +410,39 @@ async fn handle_pads (
 
         match switch {
             Switch::None => {
-                if push_oneshot_sw.is_low() {
-                    switch = Switch::PushToOneshots;
-                } else if play_oneshot_sw.is_low() {
-                    switch = Switch::PlayOneshot { played: false };
-                } else if cut_sw.is_low() {
-                    switch = Switch::PushToCuts { pad_index: None };
+                if push_file_sw.is_low() {
+                    switch = Switch::PushFile { pad_index: None };
                 } else if seq_sw.is_low() {
                     switch = Switch::PushToSequence;
+                } else if play_oneshot_sw.is_low() {
+                    switch = Switch::PlayOneshot { played: false };
                 } else {
                     handle_step_sequence(prev_downs, downs.clone()).await;
                 }
             },
-            Switch::PushToOneshots => {
-                if push_oneshot_sw.is_high() {
-                    switch = Switch::None;
-                    prev_filepath = None;
-                } else if let Some(ref filepaths) = filepaths {
-                    let filepath = filepath(lock_async_mut!(ADC).read(&mut fs_pin), filepaths.clone());
-                    if prev_filepath.clone().is_none() || prev_filepath.clone().is_some_and(|p| p != filepath) {
-                        defmt::info!("targeting filepath: {}", defmt::Debug2Format(&filepath));
-                        prev_filepath = Some(filepath.clone());
-                    }
-
-                    if downs.len() > prev_downs.len() {
-                        if let Some(down) = downs.last().map(|i| *i as usize) {
-                            let _ = COMMAND_CHANNEL.send(Command::PushToOneshots { path: filepath, pad_index: down }).await;
+            Switch::PushFile { ref mut pad_index } => {
+                if push_file_sw.is_high() {
+                    if let Some(pad_index) = pad_index.take() {
+                        if filepaths.is_none() {
+                            let _ = COMMAND_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
+                            filepaths = Some(PATHS_CHANNEL.receive().await);
                         }
+                        let filepath = filepath(&mut adc_buf, lock_async_mut!(ADC).read(lock_async_mut!(POT_PIN)), filepaths.clone().unwrap());
+
+                        let _ = COMMAND_CHANNEL.send(Command::PushToOneshots { path: filepath, pad_index }).await;
                     }
-                } else {
-                    let _ = COMMAND_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
-                    filepaths = Some(PATHS_CHANNEL.receive().await);
-                }
-            },
-            Switch::PlayOneshot {ref mut played }=> {
-                if play_oneshot_sw.is_high() {
-                    if !*played {
-                        let _ = COMMAND_CHANNEL.send(Command::PlayOneshot { pad_index: None }).await;
-                    }
-                    switch = Switch::None;
-                } else if downs.len() > prev_downs.len() {
-                    if let Some(down) = downs.last().map(|i| *i as usize) {
-                        *played = true;
-                        let _ = COMMAND_CHANNEL.send(Command::PlayOneshot { pad_index: Some(down) }).await;
-                    }
-                }
-            },
-            Switch::PushToCuts { ref mut pad_index } => {
-                if cut_sw.is_high() {
                     switch = Switch::None;
                     prev_filepath = None;
+                    adc_buf.clear();
 
                     let _ = COMMAND_CHANNEL.send(Command::BakeCuts).await;
-                } else if let Some(ref filepaths) = filepaths {
-                    let filepath = filepath(lock_async_mut!(ADC).read(&mut fs_pin), filepaths.clone());
+                } else {
+                    if filepaths.is_none() {
+                        let _ = COMMAND_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
+                        filepaths = Some(PATHS_CHANNEL.receive().await);
+                    }
+                    let filepath = filepath(&mut adc_buf, lock_async_mut!(ADC).read(lock_async_mut!(POT_PIN)), filepaths.clone().unwrap());
+
                     if prev_filepath.clone().is_none() || prev_filepath.clone().is_some_and(|p| p != filepath) {
                         defmt::info!("targeting filepath: {}", defmt::Debug2Format(&filepath));
                         prev_filepath = Some(filepath.clone());
@@ -460,9 +460,6 @@ async fn handle_pads (
                             }
                         }
                     }
-                } else {
-                    let _ = COMMAND_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
-                    filepaths = Some(PATHS_CHANNEL.receive().await);
                 }
             },
             Switch::PushToSequence => {
@@ -473,6 +470,19 @@ async fn handle_pads (
                 } else if downs.len() > prev_downs.len() {
                     if let Some(pad_index) = downs.last().map(|i| *i as usize) {
                         let _ = COMMAND_CHANNEL.send(Command::PushToSequence { pad_index }).await;
+                    }
+                }
+            },
+            Switch::PlayOneshot { ref mut played }=> {
+                if play_oneshot_sw.is_high() {
+                    if !*played {
+                        let _ = COMMAND_CHANNEL.send(Command::PlayOneshot { pad_index: None }).await;
+                    }
+                    switch = Switch::None;
+                } else if downs.len() > prev_downs.len() {
+                    if let Some(down) = downs.last().map(|i| *i as usize) {
+                        *played = true;
+                        let _ = COMMAND_CHANNEL.send(Command::PlayOneshot { pad_index: Some(down) }).await;
                     }
                 }
             },
@@ -499,7 +509,7 @@ async fn handle_step_sequence(
                     let numerator = downs
                         .iter()
                         .skip(1)
-                        .map(|d| d.checked_sub(step + 1).unwrap_or(d + PAD_COUNT as u8- 1 - step))
+                        .map(|d| d.checked_sub(step + 1).unwrap_or(d + PAD_COUNT as u8 - 1 - step))
                         .fold(0u32, |acc, d| acc | 1 << d);
                     let length = utils::Fraction::new(numerator, 16);
 

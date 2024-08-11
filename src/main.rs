@@ -354,8 +354,8 @@ async fn handle_tempo (
 
     loop {
         if sw.is_low() {
-        let length = adc_buf.len();
-        adc_buf.push_back(lock_async_mut!(ADC).read(lock_async_mut!(POT_PIN)));
+            adc_buf.push_back(lock_async_mut!(ADC).read(lock_async_mut!(POT_PIN)));
+            let length = adc_buf.len();
             let wma = adc_buf
                 .iter()
                 .enumerate()
@@ -399,7 +399,7 @@ async fn handle_pads (
             .fold(0.0, |acc, (i, &v)| {
                 acc + v as f32 * (i + 1) as f32
             }) / (length * (length + 1) / 2) as f32;
-        let file_index = ((wma / ADC_MAX as f32).clamp(0.0, 1.0) * filepaths.len() as f32) as usize;
+        let file_index = (wma / (ADC_MAX + 1) as f32 * filepaths.len() as f32) as usize;
         filepaths[file_index].clone()
     };
 

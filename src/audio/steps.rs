@@ -540,7 +540,26 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
         let step_len = self.step_len().ok_or(Error::NotFound)?;
         let seq_step_count = self.steps_until_seq_index(self.seq.len()).ok_or(Error::NotFound)? as f32;
         if let State::Desync { ref mut sync_step, .. } = self.state {
-            *sync_step += buf.len() as f32 / self.sync_speed / step_len as f32;
+            let sync_seq_index = {
+                let mut step_count = 0;
+                self.seq
+                    .iter()
+                    .enumerate()
+                    .find(|(_, &cuts_idx)| {
+                        step_count += self.cuts.get(cuts_idx).and_then(|c| {
+                            c.as_ref().map(|c| c.slice_step_count)
+                        }).unwrap_or(0);
+                        step_count > *sync_step as usize
+                    })
+                    .map(|(seq_idx, _)| seq_idx)
+            }.unwrap();
+            let sync_tempo = self.cuts.get(sync_seq_index).and_then(|c| {
+                c.as_ref().map(|c| c.file_rhythm.tempo())
+            }).ok_or(Error::NotFound)?;
+            *sync_step += buf.len() as f32
+                / self.sync_speed
+                * self.anchor_tempo.ok_or(Error::NotFound)? / sync_tempo
+                / step_len as f32;
             *sync_step %= seq_step_count;
         }
 

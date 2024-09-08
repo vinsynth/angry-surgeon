@@ -8,46 +8,55 @@ mod utils;
 
 use audio::fx::Bitcrush;
 use audio::steps::{Command, Event, Steps};
-use embassy_stm32::exti::ExtiInput;
 use fs::SdioCard;
-use pwm::InterruptPwm;
+use pwm::RingBufferedPwm;
 use utils::AsyncMutex;
 
 use defmt_rtt as _;
 use panic_probe as _;
 
 extern crate alloc;
-use alloc::vec;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 use alloc::string::String;
 
-use core::cell::RefCell;
-
-use cortex_m::peripheral::NVIC;
-
 use embassy_executor::Spawner;
-use embassy_sync::blocking_mutex::CriticalSectionMutex as SyncMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex as RawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::Timer;
+use embassy_sync::pubsub::{PubSubBehavior, PubSubChannel};
+use embassy_time::Instant;
 
 use embassy_stm32::{gpio, interrupt, sdmmc};
+use embassy_stm32::interrupt::InterruptExt;
 use embassy_stm32::peripherals::{ADC1, TIM4};
 use embassy_stm32::time::Hertz;
 
-const PAD_COUNT: usize = 12;
+const PAD_COUNT: usize = 14;
+const GRAIN_LEN: usize = 256;
 const ADC_MAX: u16 = 4095;
 
-type RingBuf<T, const CAP: usize> = arraydeque::ArrayDeque<T, CAP, arraydeque::Wrapping>;
+#[derive(Copy, Clone)]
+enum LoggedMxEvent {
+    Up(Instant),
+    Down(Instant),
+}
+
+#[derive(Clone, PartialEq)]
+enum MxEvent {
+    Down(u8),
+    Up(u8),
+}
 
 static ADC: AsyncMutex<Option<embassy_stm32::adc::Adc<ADC1>>> = AsyncMutex::new(None);
 static POT_PIN: AsyncMutex<Option<embassy_stm32::peripherals::PA4>> = AsyncMutex::new(None);
-static MTX: AsyncMutex<RefCell<Vec<u8>>> = AsyncMutex::new(RefCell::new(Vec::new()));
-static PWM: SyncMutex<RefCell<Option<InterruptPwm<TIM4>>>> = SyncMutex::new(RefCell::new(None));
 static BITCRUSH: AsyncMutex<Bitcrush> = AsyncMutex::new(Bitcrush::new());
 
+static mut MX_INS: Option<[gpio::Input; 4]> = None;
+static mut MX_OUTS: Option<[gpio::Output; 4]> = None;
+
+static mut TIMER: Option<embassy_stm32::timer::low_level::Timer<embassy_stm32::peripherals::TIM3>> = None;
+
 static COMMAND_CHANNEL: Channel<RawMutex, Command, 1> = Channel::new();
+static MX_CHANNEL: PubSubChannel<RawMutex, MxEvent, 1, 2, 4> = PubSubChannel::new();
 
 embassy_stm32::bind_interrupts!(struct Irqs {
     SDIO => sdmmc::InterruptHandler<embassy_stm32::peripherals::SDIO>;
@@ -104,17 +113,18 @@ async fn main(spawner: Spawner) {
     );
 
     let mut err = None;
-    while let Err(e) = sdmmc.init_card(Hertz::mhz(16)).await {
+    while let Err(e) = sdmmc.init_card(Hertz::mhz(24)).await {
         if err != Some(e) {
             defmt::info!("waiting for card error, retrying: {:?}", e);
             err = Some(e);
         }
     }
+    defmt::info!("clk: {}", sdmmc.clock());
 
     let card = SdioCard::new(sdmmc);
     let slice = crate::expect!(
         card.into_stream_slice().await,
-        "failed to init strea slice",
+        "failed to init stream slice",
     );
     let fs_options = embedded_fatfs::FsOptions::new();
     let fs = crate::expect!(
@@ -135,18 +145,19 @@ async fn main(spawner: Spawner) {
     );
 
     defmt::info!("init pwm...");
-    let mut pwm = InterruptPwm::new(
+    let mut pwm = RingBufferedPwm::empty(
         p.TIM4,
-        None,
-        None,
-        Some(embassy_stm32::timer::simple_pwm::PwmPin::new_ch3(p.PB8, gpio::OutputType::PushPull)),
-        None,
-        Hertz::khz(32)
+        Hertz::khz(32),
+        embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
     );
-    let _ = pwm.enable(embassy_stm32::timer::Channel::Ch3);
-
-    PWM.lock(|p| p.replace(Some(pwm)));
-    unsafe { NVIC::unmask(embassy_stm32::interrupt::TIM4) };
+    let max_duty = pwm.get_max_duty() as u16;
+    let dma_buf = cortex_m::singleton!(: [u16; GRAIN_LEN] = [0; GRAIN_LEN]).unwrap();
+    pwm.start_ch1(
+        embassy_stm32::timer::simple_pwm::PwmPin::new_ch1(p.PB6, gpio::OutputType::PushPull),
+        p.DMA1_CH0,
+        dma_buf,
+    );
+    spawner.must_spawn(pwm_out(pwm));
 
     defmt::info!("init matrix...");
     macro_rules! new_output {
@@ -167,47 +178,40 @@ async fn main(spawner: Spawner) {
         };
     }
 
-    let mx_input0 = new_input!(p.PB3);
-    let mx_input1 = new_input!(p.PB6);
-    let mx_input2 = new_input!(p.PB7);
-    let mx_input3 = new_input!(p.PB9);
+    let mx_inputs = [
+        new_input!(p.PB3),       
+        new_input!(p.PB7),
+        new_input!(p.PB8),
+        new_input!(p.PB9),
+    ];
+    unsafe { MX_INS.replace(mx_inputs) };
+    let mx_outputs = [
+        new_output!(p.PA15),
+        new_output!(p.PA12),
+        new_output!(p.PA11),
+        new_output!(p.PA10),        
+    ];
+    unsafe { MX_OUTS.replace(mx_outputs) };
 
-    let mx_output0 = new_output!(p.PA10);
-    let mx_output1 = new_output!(p.PA11);
-    let mx_output2 = new_output!(p.PA12);
-    let mx_output3 = new_output!(p.PA15);
+    let timer = embassy_stm32::timer::low_level::Timer::new(p.TIM3);
+    timer.set_frequency(Hertz(1000));
+    timer.set_counting_mode(embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
+    timer.start();
+    timer.enable_update_interrupt(true);
 
-    let _ = spawner.spawn(handle_matrix(
-        [mx_input0, mx_input1, mx_input2, mx_input3],
-        [mx_output0, mx_output1, mx_output2, mx_output3],
-    ));
+    unsafe { TIMER.replace(timer) };
+    unsafe { cortex_m::peripheral::NVIC::unmask(embassy_stm32::interrupt::TIM3) };
 
-    let _ = spawner.spawn(handle_recording(
-        ExtiInput::new(p.PA0, p.EXTI0, gpio::Pull::Up)
-    ));
+    spawner.must_spawn(handle_pads());
 
     defmt::info!("init adc...");
     let adc = embassy_stm32::adc::Adc::new(p.ADC1);
     ADC.lock().await.replace(adc);
     POT_PIN.lock().await.replace(p.PA4);
 
-    let _ = spawner.spawn(handle_tempo(new_input!(p.PB0)));
-
-    let _ = spawner.spawn(handle_pads(
-        new_input!(p.PB14),
-        new_input!(p.PB12),
-        new_input!(p.PB10),
-    ));
-
-    let _ = spawner.spawn(handle_joystick(
-        p.PA2,
-        p.PA3,
-        new_input!(p.PB13),
-    ));
-
     defmt::info!("enter idle!");
     loop {
-        // handle steps
+         // handle steps
         use block_device_adapters::StreamSliceError;
         use embedded_fatfs::Error;
 
@@ -270,185 +274,87 @@ async fn main(spawner: Spawner) {
                 defmt::info!("baked sequence!");
             },
             Command::StepCount { sender } => sender.send(steps.step_count().unwrap_or(0)).await,
-            Command::Paths { sender } => sender.send(steps.paths()).await,
+            Command::Paths { sender } => {
+                sender.send(steps.paths()).await;
+                defmt::info!("sent paths!");
+            },
             Command::ReadCut { sender } => {
-                let mut grain = match steps.read_cut().await {
-                    Err(StreamSliceError::Other(Error::NotFound)) => Box::new([u8::MAX / 2; 512]),
+                let mut grain = [0; GRAIN_LEN];
+                match steps.read_cut(max_duty, &mut grain).await {
+                    Err(StreamSliceError::Other(Error::NotFound)) => (),
                     Err(e) => defmt::panic!("failed to read cut: {}", defmt::Debug2Format(&e)),
-                    Ok(g) => g,
+                    _ => (),
                 };
-                let oneshot = match steps.read_oneshot().await {
-                    Err(StreamSliceError::Other(Error::NotFound)) => {
-                        vec![u8::MAX / 2; grain.len()].into_boxed_slice()
-                    },
-                    Err(e) => defmt::panic!("failed to read oneshot: {}", defmt::Debug2Format(&e)),
-                    Ok(g) => g,
-                };
-                grain
-                    .iter_mut()
-                    .zip(oneshot.iter())
-                    .for_each(|(g, o)| {
-                        *g = ((*g as f32 + *o as f32) / 2.0) as u8;
-                    });
-                BITCRUSH.lock().await.crush(&mut grain);
                 sender.send(grain).await;
             },
         }
     }
 }
 
-/// 4x4 button matrix where mosi pins -> columns, miso pins -> rows
 #[embassy_executor::task]
-async fn handle_matrix(
-    mx_inputs: [gpio::Input<'static>; 4],
-    mut mx_outputs: [gpio::Output<'static>; 4],
+async fn pwm_out(
+    mut pwm: RingBufferedPwm<'static, TIM4, u16>,
 ) {
-    let mut prev_downs = Vec::new();
+    let grain_channel = cortex_m::singleton!(
+        : Channel<RawMutex, [u16; GRAIN_LEN], 1> = Channel::new()
+    ).unwrap();
+    let mut buffer = [0; GRAIN_LEN];
+
     loop {
-        let mut downs = prev_downs.clone();
-
-        for (out_idx, mx_output) in mx_outputs.iter_mut().enumerate() {
-            mx_output.set_low();
-            for (in_idx, mx_input) in mx_inputs.iter().enumerate() {
-                let index = in_idx as u8 * 4 + out_idx as u8;
-                if mx_input.is_high() && downs.contains(&index) {
-                    downs.retain(|&v| v != index);
-                } else if mx_input.is_low() && !downs.contains(&index) && index < 16 {
-                    downs.push(index);
-                }
-            }
-            mx_output.set_high();
-
-            Timer::after_millis(1).await;
-        }
-
-        MTX.lock().await.borrow_mut().clone_from(&downs);
-        prev_downs = downs;
+        COMMAND_CHANNEL.send(Command::ReadCut { sender: grain_channel.sender() }).await;
+        crate::expect!(
+            pwm.write(
+                embassy_stm32::timer::Channel::Ch1,
+                &mut buffer,
+            ).await,
+            "failed to write pwm",
+        );
+        buffer = crate::expect!(
+            grain_channel.try_receive(),
+            "file read too slow :(",
+        );
     }
 }
 
 #[embassy_executor::task]
-async fn handle_recording (
-    mut sw: ExtiInput<'static>,
-) {
-    loop {
-        sw.wait_for_falling_edge().await;
-        COMMAND_CHANNEL.send(Command::RecordEvents).await;
-        Timer::after_millis(17).await;
-        sw.wait_for_rising_edge().await;
-        Timer::after_millis(17).await;
-
-        sw.wait_for_falling_edge().await;
-        COMMAND_CHANNEL.send(Command::BakeRecording).await;
-        Timer::after_millis(17).await;
-        sw.wait_for_rising_edge().await;
-        Timer::after_millis(17).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn handle_tempo (
-    sw: gpio::Input<'static>,
-) {
-    let mut adc_buf: RingBuf<u16, 16> = RingBuf::new();
-
-    loop {
-        if sw.is_low() {
-            adc_buf.push_back(lock_async_mut!(ADC).read(lock_async_mut!(POT_PIN)));
-            let length = adc_buf.len();
-            let wma = adc_buf
-                .iter()
-                .enumerate()
-                .fold(0.0, |acc, (i, &v)| {
-                    acc + v as f32 * (i + 1) as f32
-                }) / (length * (length + 1) / 2) as f32;
-            let tempo = wma / ADC_MAX as f32 * 540.0 + 60.0;
-            let _ = COMMAND_CHANNEL.send(Command::SetTempo { tempo }).await;
-        } else {
-            adc_buf.clear();
-        }
-        embassy_time::Timer::after_millis(1).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn handle_pads (
-    push_file_sw: gpio::Input<'static>,
-    seq_sw: gpio::Input<'static>,
-    play_oneshot_sw: gpio::Input<'static>,
-) {
+async fn handle_pads() {
+    #[derive(PartialEq)]
     enum Switch {
         None,
-        PushFile { pad_index: Option<usize> },
+        PushFile { pad_index: Option<usize>, filepaths: Vec<String> },
         PushToSequence,
-        PlayOneshot { played: bool },
     }
     let mut switch = Switch::None;
-
-    static PATHS_CHANNEL: Channel<RawMutex, Vec<String>, 1> = Channel::new();
-    let mut filepaths: Option<Vec<String>> = None;
-    let mut prev_filepath = None;
-
-    let mut adc_buf: RingBuf<u16, 16> = RingBuf::new();
-    let filepath = |adc_buf: &mut RingBuf<u16, 16>, adc: u16, filepaths: Vec<String>| {
-        adc_buf.push_back(adc);
-        let length = adc_buf.len();
-        let wma = adc_buf
-            .iter()
-            .enumerate()
-            .fold(0.0, |acc, (i, &v)| {
-                acc + v as f32 * (i + 1) as f32
-            }) / (length * (length + 1) / 2) as f32;
-        let file_index = (wma / (ADC_MAX + 1) as f32 * filepaths.len() as f32) as usize;
-        filepaths[file_index].clone()
-    };
-
+    let mut subscriber = MX_CHANNEL.dyn_subscriber().unwrap();
     let mut prev_downs = Vec::new();
 
+    let paths_channel = cortex_m::singleton!(: Channel<RawMutex, Vec<String>, 1> = Channel::new()).unwrap();
+
     loop {
-        let downs = MTX.lock().await.borrow().clone();
+        let event = subscriber.next_message_pure().await;
+        let mut downs = prev_downs.clone();
 
-        match switch {
-            Switch::None => {
-                if push_file_sw.is_low() {
-                    switch = Switch::PushFile { pad_index: None };
-                } else if seq_sw.is_low() {
-                    switch = Switch::PushToSequence;
-                } else if play_oneshot_sw.is_low() {
-                    switch = Switch::PlayOneshot { played: false };
-                } else {
-                    handle_step_sequence(prev_downs, downs.clone()).await;
-                }
+        match event {
+            MxEvent::Down(14) => {
+                let _ = COMMAND_CHANNEL.send(Command::Paths { sender: paths_channel.sender() }).await;
+                let filepaths = paths_channel.receive().await;
+
+                switch = Switch::PushFile { pad_index: None, filepaths };
             },
-            Switch::PushFile { ref mut pad_index } => {
-                if push_file_sw.is_high() {
-                    if let Some(pad_index) = pad_index.take() {
-                        if filepaths.is_none() {
-                            let _ = COMMAND_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
-                            filepaths = Some(PATHS_CHANNEL.receive().await);
-                        }
-                        let filepath = filepath(&mut adc_buf, lock_async_mut!(ADC).read(lock_async_mut!(POT_PIN)), filepaths.clone().unwrap());
+            MxEvent::Down(15) => switch = Switch::PushToSequence,
+            MxEvent::Down(idx) => {
+                downs.push(idx);
 
-                        let _ = COMMAND_CHANNEL.send(Command::PushToOneshots { path: filepath, pad_index }).await;
-                    }
-                    switch = Switch::None;
-                    prev_filepath = None;
-                    adc_buf.clear();
+                match switch {
+                    Switch::None => handle_step_sequence(prev_downs, &downs).await,
+                    Switch::PushFile { ref mut pad_index, ref filepaths } => {
+                        let file_index = (
+                            lock_async_mut!(ADC).read(lock_async_mut!(POT_PIN)) as f32
+                                / (ADC_MAX + 1) as f32
+                                * filepaths.len() as f32
+                        ) as usize;
+                        let filepath = filepaths[file_index].clone();
 
-                    let _ = COMMAND_CHANNEL.send(Command::BakeCuts).await;
-                } else {
-                    if filepaths.is_none() {
-                        let _ = COMMAND_CHANNEL.send(Command::Paths { sender: PATHS_CHANNEL.sender() }).await;
-                        filepaths = Some(PATHS_CHANNEL.receive().await);
-                    }
-                    let filepath = filepath(&mut adc_buf, lock_async_mut!(ADC).read(lock_async_mut!(POT_PIN)), filepaths.clone().unwrap());
-
-                    if prev_filepath.clone().is_none() || prev_filepath.clone().is_some_and(|p| p != filepath) {
-                        defmt::info!("targeting filepath: {}", defmt::Debug2Format(&filepath));
-                        prev_filepath = Some(filepath.clone());
-                    }
-
-                    if downs.len() > prev_downs.len() {
                         if let Some(down) = downs.last().map(|i| *i as usize) {
                             if let Some(pad_index) = pad_index.take() {
                                 // assign steps of file to pad
@@ -459,46 +365,43 @@ async fn handle_pads (
                                 *pad_index = Some(down);
                             }
                         }
+                    },
+                    Switch::PushToSequence => {
+                        if let Some(pad_index) = downs.last().map(|i| *i as usize) {
+                            let _ = COMMAND_CHANNEL.send(Command::PushToSequence { pad_index }).await;
+                        }
                     }
                 }
             },
-            Switch::PushToSequence => {
-                if seq_sw.is_high() {
-                    switch = Switch::None;
-                    
-                    let _ = COMMAND_CHANNEL.send(Command::BakeSequence).await;
-                } else if downs.len() > prev_downs.len() {
-                    if let Some(pad_index) = downs.last().map(|i| *i as usize) {
-                        let _ = COMMAND_CHANNEL.send(Command::PushToSequence { pad_index }).await;
-                    }
-                }
+            MxEvent::Up(14) => {
+                let _ = COMMAND_CHANNEL.send(Command::BakeCuts).await;
+
+                switch = Switch::None;
             },
-            Switch::PlayOneshot { ref mut played }=> {
-                if play_oneshot_sw.is_high() {
-                    if !*played {
-                        let _ = COMMAND_CHANNEL.send(Command::PlayOneshot { pad_index: None }).await;
-                    }
-                    switch = Switch::None;
-                } else if downs.len() > prev_downs.len() {
-                    if let Some(down) = downs.last().map(|i| *i as usize) {
-                        *played = true;
-                        let _ = COMMAND_CHANNEL.send(Command::PlayOneshot { pad_index: Some(down) }).await;
-                    }
+            MxEvent::Up(15) => {
+                let _ = COMMAND_CHANNEL.send(Command::BakeSequence).await;
+
+                switch = Switch::None;
+            },
+            MxEvent::Up(idx) => {
+                downs.retain(|&i| i != idx);
+
+                if switch == Switch::None {
+                    handle_step_sequence(prev_downs, &downs).await;
                 }
             },
         }
         prev_downs = downs;
-        Timer::after_millis(1).await;
     }
 }
 
 async fn handle_step_sequence(
     prev_downs: Vec<u8>,
-    downs: Vec<u8>,
+    downs: &Vec<u8>,
 ) {
     static COUNT_CHANNEL: Channel<RawMutex, usize, 1> = Channel::new();
 
-    if prev_downs != downs {
+    if prev_downs != *downs {
         let _ = COMMAND_CHANNEL.send(Command::StepCount { sender: COUNT_CHANNEL.sender() }).await;
         let step_count = COUNT_CHANNEL.receive().await;
 
@@ -538,71 +441,46 @@ async fn handle_step_sequence(
     }
 }
 
-#[embassy_executor::task]
-async fn handle_joystick(
-    mut x_pin: impl embassy_stm32::adc::AdcPin<ADC1> + 'static,
-    mut y_pin: impl embassy_stm32::adc::AdcPin<ADC1> + 'static,
-    joy_sw: gpio::Input<'static>,
-) {
-    let mut buf: RingBuf<(u16, u16), 16> = RingBuf::new();
-    loop {
-        if joy_sw.is_low() {
-            let x = lock_async_mut!(ADC).read(&mut x_pin);
-            let y = lock_async_mut!(ADC).read(&mut y_pin);
-            buf.push_back((x, y));
-
-            let (x, y) = {
-                let length = buf.len();
-                let (x, y) = buf
-                    .iter()
-                    .enumerate()
-                    .fold((0.0, 0.0), |acc, (i, v)| (
-                        acc.0 + v.0 as f32 * (i + 1) as f32,
-                        acc.1 + v.1 as f32 * (i + 1) as f32
-                    ));
-                (
-                    x / (length * (length + 1) / 2) as f32 / ADC_MAX as f32,
-                    y / (length * (length + 1) / 2) as f32 / ADC_MAX as f32,
-                )
-            };
-            let bit_depth = (x + 1.0) * (x - 1.0) + 1.0;
-            let rate = (y + 1.0) * (y - 1.0) + 1.0;
-            BITCRUSH.lock().await.set_bit_depth(bit_depth);
-            BITCRUSH.lock().await.set_rate(rate);
-        }
-
-        Timer::after_millis(1).await;
-    }
-}
-
 #[interrupt]
-fn TIM4() {
-    static CHANNEL: Channel<RawMutex, Box<[u8]>, 1> = Channel::new();
-    static mut BUFFER: Option<Box<[u8]>> = None;
-    static mut INDEX: usize = 0;
-    static mut PWM_THIS: Option<InterruptPwm<TIM4>> = None;
-    let buffer = BUFFER.get_or_insert_with(|| Box::new([]));
-    let pwm = PWM_THIS.get_or_insert_with(|| {
-        PWM.lock(|pwm| pwm.take().unwrap())
+fn TIM3() {
+    static mut TIMER_THIS: Option<embassy_stm32::timer::low_level::Timer<embassy_stm32::peripherals::TIM3>> = None;
+    static mut MX_INS_THIS: Option<[gpio::Input; 4]> = None;
+    static mut MX_OUTS_THIS: Option<[gpio::Output; 4]> = None;
+
+    static mut OUT_IDX: usize = 0;
+    static mut EVENT_LOG: [LoggedMxEvent; 16] = [LoggedMxEvent::Up(Instant::MIN); 16];
+
+    let timer = TIMER_THIS.get_or_insert_with(|| {
+        unsafe { TIMER.take().unwrap() }
+    });
+    let mx_ins = MX_INS_THIS.get_or_insert_with(|| {
+        unsafe { MX_INS.take().unwrap() }
+    });
+    let mx_outs = MX_OUTS_THIS.get_or_insert_with(|| {
+        unsafe { MX_OUTS.take().unwrap() }
     });
 
-    if *INDEX >= buffer.len() {
-        *INDEX = 0;
-        if CHANNEL.is_full() {
-            *buffer = CHANNEL.try_receive().unwrap();
+    mx_outs[*OUT_IDX].set_low();
+    for (in_idx, mx_in) in mx_ins.iter().enumerate() {
+        let mx_index = in_idx * 4 + *OUT_IDX;
+        if mx_in.is_high() && matches!(EVENT_LOG[mx_index], LoggedMxEvent::Down(t)
+            if Instant::now().duration_since(t).as_micros() > 1000
+        ) {
+            defmt::debug!("{} up!", mx_index);
+            EVENT_LOG[mx_index] = LoggedMxEvent::Up(embassy_time::Instant::now());
+
+            MX_CHANNEL.publish_immediate(MxEvent::Up(mx_index as u8));
+        } else if mx_in.is_low() && matches!(EVENT_LOG[mx_index], LoggedMxEvent::Up(t)
+            if Instant::now().duration_since(t).as_micros() > 1000
+        ) {
+            defmt::debug!("{} down!", mx_index);
+            EVENT_LOG[mx_index] = LoggedMxEvent::Down(embassy_time::Instant::now());
+
+            MX_CHANNEL.publish_immediate(MxEvent::Down(mx_index as u8));
         }
-        let sender = CHANNEL.sender();
-        let _ = COMMAND_CHANNEL.try_send(Command::ReadCut { sender });
     }
+    mx_outs[*OUT_IDX].set_high();
+    *OUT_IDX = (*OUT_IDX + 1) % 4;
 
-    let sample = buffer.get(*INDEX).copied().unwrap_or(u8::MAX / 2);
-    *INDEX += 1;
-
-    let duty = (sample as f32 / u8::MAX as f32 * pwm.get_max_duty() as f32) as u32;
-
-    if let Err(e) = pwm.set_duty(embassy_stm32::timer::Channel::Ch3, duty) {
-        defmt::panic!("failed to set duty: {}", defmt::Debug2Format(&e));
-    }
-
-    pwm.clear_update_interrupt();
+    timer.clear_update_interrupt();
 }

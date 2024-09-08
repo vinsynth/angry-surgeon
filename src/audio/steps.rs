@@ -30,10 +30,30 @@ pub enum Command<'a> {
     BakeSequence,
     StepCount { sender: StepsSender<'a, usize, 1> },
     Paths { sender: StepsSender<'a, Vec<String>, 1> },
-    ReadCut { sender: StepsSender<'a, Box<[u8]>, 1> },
+    ReadCut { sender: StepsSender<'a, [u16; crate::GRAIN_LEN], 1> },
+}
+impl<'a> core::fmt::Debug for Command<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let text = match self {
+            Command::SetTempo { .. } => "SetTempo",
+            Command::RecordEvents => "RecordEvents",
+            Command::BakeRecording => "BakeRecording",
+            Command::PushEvent { .. } => "PushEvent",
+            Command::PushToOneshots { .. } => "PushToOneshots",
+            Command::PlayOneshot { .. } => "PlayOneshot",
+            Command::PushToCuts { .. } => "PushToCuts",
+            Command::BakeCuts => "BakeCuts",
+            Command::PushToSequence { .. } => "PushToSequence",
+            Command::BakeSequence => "BakeSequence",
+            Command::StepCount { .. } => "StepCount",
+            Command::Paths { .. } => "Paths",
+            Command::ReadCut { .. } => "ReadCut",
+        };
+        write!(f, "{}", text)
+    }
 }
 
-#[derive(Copy,Clone, Eq, PartialEq, Debug, defmt::Format)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, defmt::Format)]
 pub enum Event {
     Sync,
     Hold { step: usize },
@@ -479,7 +499,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
     }
 
     /// read grain of current cut(s) in sequence
-    pub async fn read_cut(&mut self) -> Result<Box<[u8]>, StreamSliceError<Error<IO::Error>>> {
+    pub async fn read_cut(&mut self, max_duty: u16, buffer: &mut [u16]) -> Result<(), StreamSliceError<Error<IO::Error>>> {
         // handle event recording
         if self.event_log.is_some() {
             self.recall_event().await?;
@@ -512,28 +532,27 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
             }
         }
 
-        let mut output = vec![u8::MAX / 2; self.grain_len().ok_or(Error::NotFound)?].into_boxed_slice();
-        let mut buf = vec![u8::MAX / 2; (self.grain_len().ok_or(Error::NotFound)? as f32 * self.speed()) as usize].into_boxed_slice();
+        let mut bytes = vec![u8::MAX / 2; (buffer.len() as f32 * self.speed()) as usize].into_boxed_slice();
 
         // read cut(s) in seq until buffer full
         let mut read = match self.cut_mut() {
-            Some(c) => Some(c.slice.read_exact(&mut buf).await),
+            Some(c) => Some(c.slice.read_exact(&mut bytes).await),
             None => None,
         };
         while read.as_ref().is_some_and(|r| r.is_err()) {
             self.advance_seq().await?;
             read = match self.cut_mut() {
-                Some(c) => Some(c.slice.read_exact(&mut buf).await),
+                Some(c) => Some(c.slice.read_exact(&mut bytes).await),
                 None => None,
             };
         }
 
         // resample via linear interpolation
-        for (out_idx, out) in output.iter_mut().enumerate() {
-            let buf_idx = out_idx as f32 * self.speed();
-            *out = (buf_idx.fract() * *buf.get(buf_idx as usize).unwrap_or(&(u8::MAX / 2)) as f32
-                + (1.0 - buf_idx.fract()) * *buf.get(buf_idx as usize + 1).unwrap_or(&(u8::MAX / 2)) as f32
-            ) as u8;
+        for (buf_idx, buf) in buffer.iter_mut().enumerate() {
+            let bytes_idx = buf_idx as f32 * self.speed();
+            *buf = ((bytes_idx.fract() * *bytes.get(bytes_idx as usize).unwrap_or(&(u8::MAX / 2)) as f32
+                + (1.0 - bytes_idx.fract()) * *bytes.get(bytes_idx as usize + 1).unwrap_or(&(u8::MAX / 2)) as f32
+            ) / u8::MAX as f32 * max_duty as f32) as u16;
         }
 
         // sync desync
@@ -556,14 +575,14 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Steps<'a, IO,
             let sync_tempo = self.cuts.get(sync_seq_index).and_then(|c| {
                 c.as_ref().map(|c| c.file_rhythm.tempo())
             }).ok_or(Error::NotFound)?;
-            *sync_step += buf.len() as f32
+            *sync_step += bytes.len() as f32
                 / self.sync_speed
                 * self.anchor_tempo.ok_or(Error::NotFound)? / sync_tempo
                 / step_len as f32;
             *sync_step %= seq_step_count;
         }
 
-        Ok(output)
+        Ok(())
     }
 
     async fn advance_seq(&mut self) -> Result<(), StreamSliceError<Error<IO::Error>>> {

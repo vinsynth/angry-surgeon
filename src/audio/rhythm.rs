@@ -15,7 +15,7 @@ pub struct RhythmData {
 impl RhythmData {
     pub async fn new<IO, TP, OCC>(
         file: &mut File<'_, IO, TP, OCC>,
-        file_length: u64
+        file_length: u64,
     ) -> Result<Self, Error<IO::Error>>
     where
         IO: ReadWriteSeek,
@@ -33,13 +33,11 @@ impl RhythmData {
         let mut buf = [0; FFT_LEN];
         let mut prev_spectrum = None;
         while file.read_exact(&mut buf).await.is_ok() {
-            file.seek(SeekFrom::Current(HOP_SIZE as i64 - FFT_LEN as i64)).await?;
+            file.seek(SeekFrom::Current(HOP_SIZE as i64 - FFT_LEN as i64))
+                .await?;
 
             let mut samples = [0.0; FFT_LEN];
-            samples
-                .iter_mut()
-                .zip(buf)
-                .for_each(|(s, b)| *s = b as f32);
+            samples.iter_mut().zip(buf).for_each(|(s, b)| *s = b as f32);
 
             let complex = microfft::real::rfft_64(&mut samples);
             complex[0].im = 0.0;
@@ -59,16 +57,13 @@ impl RhythmData {
                 // wavelet correlation
                 let pcm_length = file_length - 0x2c;
                 let pcm_offset = file.stream_position().await? - 0x2c;
-                correlations
-                    .iter_mut()
-                    .enumerate()
-                    .for_each(|(mut i, v)| {
-                        i += 1;
-                        let wavelet_len = pcm_length as f32 / i as f32;
-                        let t = (pcm_offset as f32 / wavelet_len).fract();
-                        let wavelet = (t - 1.0).powi(2);
-                        *v += wavelet * energy
-                    });
+                correlations.iter_mut().enumerate().for_each(|(mut i, v)| {
+                    i += 1;
+                    let wavelet_len = pcm_length as f32 / i as f32;
+                    let t = (pcm_offset as f32 / wavelet_len).fract();
+                    let wavelet = (t - 1.0).powi(2);
+                    *v += wavelet * energy
+                });
             }
             prev_spectrum = Some(real);
         }
@@ -80,10 +75,7 @@ impl RhythmData {
             .map(|(i, _)| i + 1)
             .unwrap();
 
-        let tempo = step_count as f32 /
-            (file_length - 0x2c) as f32 *
-            SAMPLE_RATE.0 as f32 *
-            60.0;
+        let tempo = step_count as f32 / (file_length - 0x2c) as f32 * SAMPLE_RATE.0 as f32 * 60.0;
         info!("step_count: {}, tempo: {}", step_count, tempo);
 
         Ok(RhythmData { step_count, tempo })

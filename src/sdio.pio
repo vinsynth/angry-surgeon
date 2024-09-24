@@ -1,0 +1,107 @@
+; adapted from carlk3's sdio driver implementation
+
+; cycle count plus 1 spent on clock signal low and high, respectively
+.define D0 1
+.define D1 1
+; .define D0 0
+; .define D1 0
+.define CLKDIV 1 + D0 + 1 + D1
+
+.define public SDIO_CLK_PIN_D0_OFFSET 30 ; (-2 % 32)
+
+; state machine 0 used to:
+; > generate continuous clock on SDIO_CLK
+; > send CMD packets
+; > reseice response packets
+; pin mapping for this state machine:
+; > sideset    : CLK
+; > in/out/set : CMD
+; > jmp_pin    : CMD
+
+; commands sent on TX FIFO have two words:
+; word 0 bits 31-24 : number bits in command minus 1 (usually 47)
+; word 0 bits 23-00 : first 24 bits of command packet, shifted out MSB first
+; word 1 bits 31-08 : last 24 bits of command packet, shifted out MSB first
+; word 1 bits 07-00 : number bits in response minus 1 (usually 47), 0 if no response
+
+; response put on RX FIFO, MSB first
+; partial last word padded with zeroed bits at top
+
+; state machine EXECCTRL should be set so STATUS indicates TX FIFO < 2 and that
+; AUTOPULL and AUTOPUSH are enabled
+
+; every section of even cycle count for clock alignment between labels
+
+.program cmd_clk
+	.side_set 1
+	mov osr null       side 1 [D1] ; zero OSR to prevent autopull
+wait_cmd:
+	mov y !status      side 0 [D0] ; note whether TX FIFO has data
+	jmp !y wait_cmd    side 1 [D1] ; loop if not enough data
+load_cmd:
+	out null 32        side 0 [D0] ; load fisrt word (trigger autopull)
+	out x 8            side 1 [D1] ; number bits to send minus 1
+	set pins 1         side 0 [D0] ; init CMD state to high
+	set pindirs 1      side 1 [D1] ; set SDIO_CMD as output
+send_cmd:
+	out pins 1         side 0 [D0] ; write output on CLK falling edge
+	jmp x-- send_cmd   side 1 [D1] ; loop while still bits to send
+prep_resp:
+	set pindirs 0      side 0 [D0] ; set SDIO_CMD as input
+	out x 8            side 1 [D1] ; number bits in response minus 1
+	nop                side 0 [D0] ; clock alignment for read_resp
+	jmp !x resp_done   side 1 [D1] ; skip wait_resp if no response expected
+wait_resp:
+	nop                side 0 [D0] ; clock alignment for read_resp
+	jmp pin wait_resp  side 1 [D1] ; loop until SDIO_CMD = 0 (response received)
+read_resp:
+	in pins 1          side 0 [D0] ; read input on CLK falling edge
+	jmp x-- read_resp  side 1 [D1] ; loop while still bits to read
+resp_done:
+	push               side 0 [D0] ; push response remainder
+
+; state machine 1 used to send and receive data blocks
+; pin mapping for this state machine:
+; > in/out                            : SIDO_D0..3
+; > GPIO defined at beginning of file : SDIO_CLK
+
+; program waits for start of block token, then receives data block; application
+; must set number nibbles to receive minus 1 to y register before running this
+
+.program data_rx
+wait_start:
+	mov x y                                      ; reinit number nibbles to receive
+	wait 0 pin 0                                 ; wait for 0 state on pin D0
+	wait 1 pin SDIO_CLK_PIN_D0_OFFSET [CLKDIV-1] ; wait for rising edge plus whole clock cycle
+rx_data:
+	in pins 4                         [CLKDIV-2] ; read nibble
+	jmp x-- rx_data                              ; loop until all nibbles read
+
+; application must set pindirs as output and set number nibbles to send minus 1
+; to x regester and set number response bits minus 1 to y register before
+; running this
+
+; words written to TX FIFO have words:
+; > word 0       : start token 0xFFFFFFF0
+; > word 1-128   : transmitted data (512 bytes)
+; > word 129-130 : CRC checksum
+; > word 131     : end token 0xFFFFFFFF
+
+; after card reports idle status, RX FIFO receives word containing D0 line
+; response from card
+
+.program data_tx
+	wait 0 pin SDIO_CLK_PIN_D0_OFFSET               ; wait for falling edge
+	wait 1 pin SDIO_CLK_PIN_D0_OFFSET [CLKDIV+D1-1] ; sync so write occurs on falling edge
+tx_loop:
+	out pins 4                        [D0]          ; write nibble, wait for whole clock cycle
+	jmp x-- tx_loop                   [D1]          ; loop until all nibbles written
+	set pindirs 0x00                  [D0]          ; set data bus as input
+.wrap_target
+response_loop:
+	in pins 1                         [D1]          ; read D0 pin on rising edge
+	jmp y-- response_loop             [D0]          ; loop until all response bits read
+wait_idle:
+	wait 1 pin 0                      [D1]          ; wait until card reports idle status
+	push                              [D0]          ; push response token
+.wrap

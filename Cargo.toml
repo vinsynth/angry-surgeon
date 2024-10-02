@@ -3,6 +3,9 @@ name = "angry-surgeon"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+log-sdio = []
+
 [dependencies]
 cortex-m = "0.7.7"
 cortex-m-rt = "0.7.3"
@@ -22,13 +25,14 @@ embedded-io-async = "0.6.1"
 embedded-sdmmc = { git = "https://github.com/peterkrull/embedded-sdmmc-rs", branch = "develop-async" }
 fugit = "0.3.7"
 portable-atomic = { version = "1.7.0", features = ["critical-section"] }
-microfft = "0.6.0"
+microfft = { version = "0.6.0", features = ["size-128"], defualt-features = false }
 micromath = { version = "2.1.0", features = ["num-traits"] }
 static_cell = "2.1.0"
 pio-proc = "0.2.2"
 pio = "0.2.1"
 fixed = "1.28.0"
 sdio-host = "0.9.0"
+biquad = "0.4.2"
 
 [dependencies.embedded-fatfs]
 path = "../embedded-fatfs/embedded-fatfs"

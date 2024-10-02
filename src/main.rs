@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod fs;
+mod rhythm;
 mod sdio;
 
 use {defmt_rtt as _, panic_probe as _};
@@ -78,18 +79,18 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(config);
 
     // pio state machine for SDIO output
-    let mut pio1 = Pio::new(p.PIO1, Irqs);
-    let clock_pin = pio1.common.make_pio_pin(p.PIN_10);
-    let cmd_pin = pio1.common.make_pio_pin(p.PIN_11);
-    let d0_pin = pio1.common.make_pio_pin(p.PIN_12);
-    let d1_pin = pio1.common.make_pio_pin(p.PIN_13);
-    let d2_pin = pio1.common.make_pio_pin(p.PIN_14);
-    let d3_pin = pio1.common.make_pio_pin(p.PIN_15);
+    let mut pio0 = Pio::new(p.PIO0, Irqs);
+    let clock_pin = pio0.common.make_pio_pin(p.PIN_10);
+    let cmd_pin = pio0.common.make_pio_pin(p.PIN_11);
+    let d0_pin = pio0.common.make_pio_pin(p.PIN_12);
+    let d1_pin = pio0.common.make_pio_pin(p.PIN_13);
+    let d2_pin = pio0.common.make_pio_pin(p.PIN_14);
+    let d3_pin = pio0.common.make_pio_pin(p.PIN_15);
     let cmd_dma_ref = p.DMA_CH1.into_ref();
     let data_dma_ref = p.DMA_CH2.into_ref();
 
     let sdio = sdio::Sdio::new(
-        pio1,
+        pio0,
         clock_pin,
         cmd_pin,
         d0_pin,
@@ -107,14 +108,14 @@ async fn main(spawner: Spawner) {
     }
 
     // pio state machine for I2S output
-    let mut pio0 = Pio::new(p.PIO0, Irqs);
-    let bit_clock_pin = pio0.common.make_pio_pin(p.PIN_18);
-    let left_right_clock_pin = pio0.common.make_pio_pin(p.PIN_19);
-    let data_pin = pio0.common.make_pio_pin(p.PIN_20);
+    let mut pio1 = Pio::new(p.PIO1, Irqs);
+    let bit_clock_pin = pio1.common.make_pio_pin(p.PIN_18);
+    let left_right_clock_pin = pio1.common.make_pio_pin(p.PIN_19);
+    let data_pin = pio1.common.make_pio_pin(p.PIN_20);
     let dma_ref = p.DMA_CH0.into_ref();
 
     spawner.must_spawn(handle_i2s(
-        pio0,
+        pio1,
         bit_clock_pin,
         left_right_clock_pin,
         data_pin,
@@ -124,10 +125,10 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn handle_i2s(
-    mut pio: Pio<'static, PIO0>,
-    bit_clock_pin: embassy_rp::pio::Pin<'static, PIO0>,
-    left_right_clock_pin: embassy_rp::pio::Pin<'static, PIO0>,
-    data_pin: embassy_rp::pio::Pin<'static, PIO0>,
+    mut pio: Pio<'static, PIO1>,
+    bit_clock_pin: embassy_rp::pio::Pin<'static, PIO1>,
+    left_right_clock_pin: embassy_rp::pio::Pin<'static, PIO1>,
+    data_pin: embassy_rp::pio::Pin<'static, PIO1>,
     mut dma_ref: embassy_rp::PeripheralRef<'static, embassy_rp::peripherals::DMA_CH0>,
 ) {
     let pwm_pio_program = pio_proc::pio_asm!(
@@ -160,7 +161,6 @@ async fn handle_i2s(
             direction: ShiftDirection::Left,
             auto_fill: true,
         };
-        // join fifos to have twice the time to start the next dma transfer
         config.fifo_join = FifoJoin::TxOnly;
         config
     };
@@ -176,7 +176,6 @@ async fn handle_i2s(
     let dma_buffer = DMA_BUFFER.init_with(|| [0u32; GRAIN_LEN * 2]);
     let (mut back_buffer, mut front_buffer) = dma_buffer.split_at_mut(GRAIN_LEN);
 
-    // start pio state machine
     pio.sm0.set_enable(true);
     let tx = pio.sm0.tx();
 
@@ -186,7 +185,7 @@ async fn handle_i2s(
         let dma_future = tx.dma_push(dma_ref.reborrow(), front_buffer);
 
         // fill back buffer with fresh audio samples before awaiting the dma future
-        let mut byte_buffer = [0u8; GRAIN_LEN * 4];
+        let mut byte_buffer = [0u8; GRAIN_LEN * 2];
         let mut slice = &mut byte_buffer[..];
         while !slice.is_empty() {
             let n = BYTE_PIPE.read(slice).await;
@@ -196,10 +195,11 @@ async fn handle_i2s(
         for (i, word) in back_buffer.iter_mut().enumerate() {
             let mut i16_buffer = [0; 2];
 
-            i16_buffer.copy_from_slice(&byte_buffer[i * 4..][0..2]);
+            i16_buffer.copy_from_slice(&byte_buffer[i * 2..][0..2]);
             let left_sample = i16::from_le_bytes(i16_buffer);
-            i16_buffer.copy_from_slice(&byte_buffer[i * 4..][2..4]);
-            let right_sample = i16::from_le_bytes(i16_buffer);
+            // i16_buffer.copy_from_slice(&byte_buffer[i * 4..][2..4]);
+            // let right_sample = i16::from_le_bytes(i16_buffer);
+            let right_sample = left_sample;
 
             *word = (left_sample as u16 as u32) << 16 | (right_sample as u16 as u32);
         }
@@ -213,7 +213,7 @@ async fn handle_i2s(
 
 #[embassy_executor::task]
 async fn handle_sdio(
-    mut sdio: sdio::Sdio<'static, PIO1>,
+    mut sdio: sdio::Sdio<'static, PIO0>,
 ) {
     use embedded_io_async::{Read, Seek, SeekFrom};
     sdio.init_card().await.unwrap();
@@ -224,13 +224,16 @@ async fn handle_sdio(
     let fs = embedded_fatfs::FileSystem::new(slice, fs_options).await.unwrap();
     let root = fs.root_dir();
 
-    let mut file = root.open_file("amen441.wav").await.unwrap();
-    file.seek(SeekFrom::Start(44)).await.unwrap();
+    let mut file = root.open_file("amen441mono.wav").await.unwrap();
+
+    let rhythm = rhythm::RhythmData::new(&mut file).await.unwrap();
+    defmt::info!("{} kicks: {}", rhythm.kicks.len(), defmt::Debug2Format(&rhythm.kicks[..8]));
+    defmt::info!("{} snares: {}", rhythm.snares.len(), defmt::Debug2Format(&rhythm.snares[..8]));
 
     defmt::debug!("successfully initialized sdio!");
-
+    file.seek(SeekFrom::Start(44)).await.unwrap();
     loop {
-        let mut buffer = [0u8; GRAIN_LEN * 4];
+        let mut buffer = [0u8; GRAIN_LEN * 2];
         file.read_exact(&mut buffer).await.unwrap();
         BYTE_PIPE.write_all(&buffer).await;
     }

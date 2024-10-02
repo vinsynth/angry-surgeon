@@ -1,3 +1,7 @@
+//! SDIO driver leveraging the rp2040's PIO module;
+//! heavily inspired by carlk3's incredible no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
+//! C library, adapted for async Rust
+
 use alloc::format;
 
 use fixed::traits::ToFixed;
@@ -200,6 +204,7 @@ impl Cmd {
     }
 }
 
+#[cfg(feature = "log_sdio")]
 fn print_blocks(start_address: &u32, blocks: &[[u8; 512]]) {
     for (idx, block) in blocks.iter().enumerate() {
         let start_byte = start_address * 512;
@@ -252,6 +257,7 @@ fn print_blocks(start_address: &u32, blocks: &[[u8; 512]]) {
     }
 }
 
+#[cfg(feature = "log-sdio")]
 fn print_words(label: &str, words: &[u32]) {
     defmt::trace!("{}:", label);
     for word in words {
@@ -262,6 +268,7 @@ fn print_words(label: &str, words: &[u32]) {
     }
 }
 
+#[cfg(feature = "log-sdio")]
 fn print_bytes(label: &str, bytes: &[u8]) {
     defmt::trace!("{}:", label);
     for byte in bytes {
@@ -551,6 +558,7 @@ impl<'d, T: Instance> Sdio<'d, T> {
         for i in 0..128 {
             buffer[4 * i..][..4].copy_from_slice(&rx_buffer[i].to_be_bytes());
         }
+        #[cfg(feature = "log-sdio")]
         print_blocks(&block_address, &[**buffer]);
 
         Ok(())
@@ -721,12 +729,14 @@ impl<'d, T: Instance> Sdio<'d, T> {
         } else {
             format!("CMD{}", cmd.cmd)
         };
+        #[cfg(feature = "log-sdio")]
         print_words(&format!("sent {}", cmd_name), &tx_buffer);
 
         let response = match cmd.resp.length() {
             48 => {
                 let mut rx_buffer = [0u32; 2];
                 self.cmd_clk_sm.rx().dma_pull(self.cmd_dma_ref.reborrow(), &mut rx_buffer).await;
+                #[cfg(feature = "log-sdio")]
                 print_words(&format!("response to {}", cmd_name), &rx_buffer);
 
                 let mut arg = 0;
@@ -750,6 +760,7 @@ impl<'d, T: Instance> Sdio<'d, T> {
             136 => {
                 let mut rx_buffer = [0u32; 5];
                 self.cmd_clk_sm.rx().dma_pull(self.cmd_dma_ref.reborrow(), &mut rx_buffer).await;
+                #[cfg(feature = "log-sdio")]
                 print_words(&format!("response to {}", cmd_name), &rx_buffer);
 
                 let mut arg_bytes = [0; 16];

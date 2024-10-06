@@ -16,6 +16,7 @@ panic-probe = { version = "0.3.1", features = ["print-defmt"] }
 
 aligned = "0.4.2"
 arraydeque = { version = "0.5.1", default-features = false }
+biquad = "0.4.2"
 critical-section = "1.1.2"
 embedded-alloc = "0.5.1"
 embedded-hal = "1.0.0"
@@ -23,16 +24,14 @@ embedded-hal-async = "1.0.0"
 embedded-hal-bus = { version = "0.2.0", features = ["async"] }
 embedded-io-async = "0.6.1"
 embedded-sdmmc = { git = "https://github.com/peterkrull/embedded-sdmmc-rs", branch = "develop-async" }
-fugit = "0.3.7"
-portable-atomic = { version = "1.7.0", features = ["critical-section"] }
-microfft = { version = "0.6.0", features = ["size-128"], defualt-features = false }
-micromath = { version = "2.1.0", features = ["num-traits"] }
-static_cell = "2.1.0"
-pio-proc = "0.2.2"
-pio = "0.2.1"
 fixed = "1.28.0"
-sdio-host = "0.9.0"
-biquad = "0.4.2"
+fugit = "0.3.7"
+microfft = { version = "0.6.0", features = ["size-256"], defualt-features = false }
+micromath = { version = "2.1.0", features = ["num-traits"] }
+pio = "0.2.1"
+pio-proc = "0.2.2"
+portable-atomic = { version = "1.7.0", features = ["critical-section"] }
+static_cell = "2.1.0"
 
 [dependencies.embedded-fatfs]
 path = "../embedded-fatfs/embedded-fatfs"

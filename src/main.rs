@@ -3,9 +3,10 @@
 
 extern crate alloc;
 
+mod audio;
 mod fs;
-mod rhythm;
 mod sdio;
+use audio::GRAIN_LEN;
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -26,9 +27,6 @@ use embassy_rp::pio::{
     ShiftDirection,
 };
 use embassy_rp::{bind_interrupts, Peripheral};
-
-const SAMPLE_RATE: u32 = 44_100;
-const GRAIN_LEN: usize = 256;
 
 static BYTE_PIPE: Pipe<RawMutex, {GRAIN_LEN * 4}> = Pipe::new();
 
@@ -154,7 +152,7 @@ async fn handle_i2s(
         config.set_out_pins(&[&data_pin]);
         const BIT_DEPTH: u32 = 16;
         const CHANNELS: u32 = 2;
-        let clock_frequency = SAMPLE_RATE * BIT_DEPTH * CHANNELS;
+        let clock_frequency = audio::SAMPLE_RATE * BIT_DEPTH * CHANNELS;
         config.clock_divider = (110_250_000. / clock_frequency as f64 / 2.).to_fixed();
         config.shift_out = ShiftConfig {
             threshold: 32,
@@ -225,10 +223,12 @@ async fn handle_sdio(
     let root = fs.root_dir();
 
     let mut file = root.open_file("amen441mono.wav").await.unwrap();
+    let file_length = root.open_meta("amen441mono.wav").await.unwrap().len();
 
-    let rhythm = rhythm::RhythmData::new(&mut file).await.unwrap();
-    defmt::info!("{} kicks: {}", rhythm.kicks.len(), defmt::Debug2Format(&rhythm.kicks[..8]));
-    defmt::info!("{} snares: {}", rhythm.snares.len(), defmt::Debug2Format(&rhythm.snares[..8]));
+    let rhythm = audio::rhythm::RhythmData::new(&mut file, file_length).await.unwrap();
+    defmt::info!("{} kicks: {}", rhythm.kicks.len(), defmt::Debug2Format(&rhythm.kicks[..4]));
+    defmt::info!("{} snares: {}", rhythm.snares.len(), defmt::Debug2Format(&rhythm.snares[..4]));
+    defmt::info!("tempo: {} || step_count: {}", rhythm.tempo, rhythm.step_count);
 
     defmt::debug!("successfully initialized sdio!");
     file.seek(SeekFrom::Start(44)).await.unwrap();

@@ -204,7 +204,7 @@ impl Cmd {
     }
 }
 
-#[cfg(feature = "log_sdio")]
+#[cfg(feature = "log-sdio")]
 fn print_blocks(start_address: &u32, blocks: &[[u8; 512]]) {
     for (idx, block) in blocks.iter().enumerate() {
         let start_byte = start_address * 512;

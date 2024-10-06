@@ -17,6 +17,7 @@ use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex as RawMutex;
 use embassy_sync::pipe::Pipe;
 
+use embassy_rp::{bind_interrupts, gpio, Peripheral};
 use embassy_rp::peripherals::{PIO0, PIO1};
 use embassy_rp::pio::{
     Config,
@@ -26,7 +27,6 @@ use embassy_rp::pio::{
     ShiftConfig,
     ShiftDirection,
 };
-use embassy_rp::{bind_interrupts, Peripheral};
 
 static BYTE_PIPE: Pipe<RawMutex, {GRAIN_LEN * 4}> = Pipe::new();
 
@@ -76,49 +76,146 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_rp::init(config);
 
-    // pio state machine for SDIO output
-    let mut pio0 = Pio::new(p.PIO0, Irqs);
-    let clock_pin = pio0.common.make_pio_pin(p.PIN_10);
-    let cmd_pin = pio0.common.make_pio_pin(p.PIN_11);
-    let d0_pin = pio0.common.make_pio_pin(p.PIN_12);
-    let d1_pin = pio0.common.make_pio_pin(p.PIN_13);
-    let d2_pin = pio0.common.make_pio_pin(p.PIN_14);
-    let d3_pin = pio0.common.make_pio_pin(p.PIN_15);
-    let cmd_dma_ref = p.DMA_CH1.into_ref();
-    let data_dma_ref = p.DMA_CH2.into_ref();
+    // // pio state machine for SDIO output
+    // let mut pio0 = Pio::new(p.PIO0, Irqs);
+    // let clock_pin = pio0.common.make_pio_pin(p.PIN_10);
+    // let cmd_pin = pio0.common.make_pio_pin(p.PIN_11);
+    // let d0_pin = pio0.common.make_pio_pin(p.PIN_12);
+    // let d1_pin = pio0.common.make_pio_pin(p.PIN_13);
+    // let d2_pin = pio0.common.make_pio_pin(p.PIN_14);
+    // let d3_pin = pio0.common.make_pio_pin(p.PIN_15);
+    // let cmd_dma_ref = p.DMA_CH1.into_ref();
+    // let data_dma_ref = p.DMA_CH2.into_ref();
 
-    let sdio = sdio::Sdio::new(
-        pio0,
-        clock_pin,
-        cmd_pin,
-        d0_pin,
-        d1_pin,
-        d2_pin,
-        d3_pin,
-        cmd_dma_ref,
-        data_dma_ref,
-    );
-    spawner.must_spawn(handle_sdio(sdio));
+    // let sdio = sdio::Sdio::new(
+    //     pio0,
+    //     clock_pin,
+    //     cmd_pin,
+    //     d0_pin,
+    //     d1_pin,
+    //     d2_pin,
+    //     d3_pin,
+    //     cmd_dma_ref,
+    //     data_dma_ref,
+    // );
+    // spawner.must_spawn(handle_sdio(sdio));
 
-    // block on SDIO init
-    while !BYTE_PIPE.is_full() {
-        embassy_time::Timer::after_millis(100).await;
+    // // block on SDIO init
+    // while !BYTE_PIPE.is_full() {
+    //     embassy_time::Timer::after_millis(100).await;
+    // }
+
+    // // pio state machine for I2S output
+    // let mut pio1 = Pio::new(p.PIO1, Irqs);
+    // let bit_clock_pin = pio1.common.make_pio_pin(p.PIN_18);
+    // let left_right_clock_pin = pio1.common.make_pio_pin(p.PIN_19);
+    // let data_pin = pio1.common.make_pio_pin(p.PIN_20);
+    // let dma_ref = p.DMA_CH0.into_ref();
+
+    // spawner.must_spawn(handle_i2s(
+    //     pio1,
+    //     bit_clock_pin,
+    //     left_right_clock_pin,
+    //     data_pin,
+    //     dma_ref,
+    // ));
+
+    macro_rules! new_input {
+        ( $x:expr ) => {
+            gpio::Input::new(
+                $x,
+                gpio::Pull::Up,
+            )
+        };
     }
 
-    // pio state machine for I2S output
-    let mut pio1 = Pio::new(p.PIO1, Irqs);
-    let bit_clock_pin = pio1.common.make_pio_pin(p.PIN_18);
-    let left_right_clock_pin = pio1.common.make_pio_pin(p.PIN_19);
-    let data_pin = pio1.common.make_pio_pin(p.PIN_20);
-    let dma_ref = p.DMA_CH0.into_ref();
-
-    spawner.must_spawn(handle_i2s(
-        pio1,
-        bit_clock_pin,
-        left_right_clock_pin,
-        data_pin,
-        dma_ref,
+    spawner.must_spawn(handle_clave(
+        new_input!(p.PIN_7),
+        new_input!(p.PIN_8),
+        new_input!(p.PIN_9),
     ));
+}
+
+#[embassy_executor::task]
+async fn handle_clave(
+    mut clave_input: gpio::Input<'static>,
+    mut kick_input: gpio::Input<'static>,
+    mut snare_input: gpio::Input<'static>,
+) {
+    use embassy_futures::select::Either3;
+
+    pub struct Debounce<'a> {
+        input: gpio::Input<'a>,
+    }
+
+    impl<'a> Debounce<'a> {
+        pub fn new(input: gpio::Input<'a>) -> Self {
+            Self { input }
+        }
+
+        pub async fn debounce(&mut self) -> gpio::Level {
+            loop {
+                let lvl1 = self.input.get_level();
+                self.input.wait_for_any_edge().await;
+                embassy_time::Timer::after_millis(20).await;
+                let lvl2 = self.input.get_level();
+                if lvl1 != lvl2 {
+                    return lvl2;
+                }
+            }
+        }
+    }
+    let mut clave_debounce = Debounce::new(clave_input);
+    let mut kick_debounce = Debounce::new(kick_input);
+    let mut snare_debounce = Debounce::new(snare_input);
+
+    let mut clave_builder: Option<audio::rhythm::ClaveBuilder> = None;
+    loop {
+        match embassy_futures::select::select3(
+            clave_debounce.debounce(),
+            kick_debounce.debounce(),
+            snare_debounce.debounce(),
+        ).await {
+            Either3::First(lvl) => {
+                if lvl == gpio::Level::High {
+                    continue;
+                }
+                if let Some(clave) = clave_builder.take() {
+                    defmt::info!("baking...");
+                    let clave = clave.bake();
+                    for stroke in clave {
+                        defmt::info!("stroke: {}", defmt::Debug2Format(&stroke));
+                    }
+                } else {
+                    clave_builder = Some(audio::rhythm::ClaveBuilder::new());
+                }
+            },
+            Either3::Second(lvl) => {
+                if lvl == gpio::Level::High {
+                    continue;
+                }
+                if let Some(clave) = clave_builder.as_mut() {
+                    defmt::info!("kick!");
+                    clave.push(audio::rhythm::Pulse {
+                        onset_type: audio::rhythm::OnsetType::Kick,
+                        position: embassy_time::Instant::now().as_millis(),
+                    });
+                }
+            },
+            Either3::Third(lvl) => {
+                if lvl == gpio::Level::High {
+                    continue;
+                }
+                if let Some(clave) = clave_builder.as_mut() {
+                    defmt::info!("snare!");
+                    clave.push(audio::rhythm::Pulse {
+                        onset_type: audio::rhythm::OnsetType::Snare,
+                        position: embassy_time::Instant::now().as_millis(),
+                    });
+                }
+            },
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -226,8 +323,7 @@ async fn handle_sdio(
     let file_length = root.open_meta("amen441mono.wav").await.unwrap().len();
 
     let rhythm = audio::rhythm::RhythmData::new(&mut file, file_length).await.unwrap();
-    defmt::info!("{} kicks: {}", rhythm.kicks.len(), defmt::Debug2Format(&rhythm.kicks[..4]));
-    defmt::info!("{} snares: {}", rhythm.snares.len(), defmt::Debug2Format(&rhythm.snares[..4]));
+    defmt::info!("{} pulses: {}", rhythm.pulses.len(), defmt::Debug2Format(&rhythm.pulses[..8]));
     defmt::info!("tempo: {} || step_count: {}", rhythm.tempo, rhythm.step_count);
 
     defmt::debug!("successfully initialized sdio!");

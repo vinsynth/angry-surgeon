@@ -13,19 +13,77 @@ const SEEK_LEN: usize = READ_LEN / 2;
 const SPECTRUM_LEN: usize = FFT_LEN.ilog2() as usize;
 
 struct Onset {
-    offset: u64,
+    position: u64,
     spectrum: [f32; SPECTRUM_LEN],
 }
 
 #[derive(Debug)]
-pub struct KickOnset(u64);
+pub enum OnsetType {
+    Kick,
+    Snare,
+}
 
+/// onset with absolute position
 #[derive(Debug)]
-pub struct SnareOnset(u64);
+pub struct Pulse {
+    pub onset_type: OnsetType,
+    pub position: u64,
+}
+
+/// onset of relative length
+#[derive(Debug)]
+pub struct Stroke {
+    onset_type: OnsetType,
+    length: usize,
+}
+
+pub struct ClaveBuilder {
+    onsets: Vec<super::rhythm::Pulse>,
+}
+
+impl ClaveBuilder {
+    pub fn new() -> Self {
+        Self { onsets: Vec::new() }
+    }
+
+    pub fn push(&mut self, pulse: super::rhythm::Pulse) {
+        self.onsets.push(pulse);
+    }
+
+    pub fn bake(self) -> Vec<super::rhythm::Stroke> {
+        let intervals = self.onsets
+            .windows(2)
+            .flat_map(<&[super::rhythm::Pulse; 2]>::try_from)
+            .map(|[a, b]| b.position - a.position)
+            .collect::<Vec<_>>();
+        let mut fundamental_appeal = (0, 0.);
+        for period in 50..intervals.iter().max().copied().unwrap_or(0) { // start with millis period of 20Hz
+            let (mut mean_sin, mut mean_cos) = intervals.iter().fold((0., 0.), |acc, i| {
+                let (sin, cos) = (2. * core::f32::consts::PI * *i as f32 / period as f32).sin_cos();
+                (acc.0 + sin, acc.1 + cos)
+            });
+            mean_sin /= intervals.len() as f32;
+            mean_cos /= intervals.len() as f32;
+
+            let appeal = 1. - (mean_sin.powi(2) + (mean_cos - 1.).powi(2)).sqrt() / 2.;
+
+            if appeal > fundamental_appeal.1 {
+                fundamental_appeal = (period, appeal);
+            }
+        }
+
+        let mut strokes = Vec::new();
+        for (i, onset) in self.onsets.into_iter().take(intervals.len()).enumerate() {
+            let onset_type = onset.onset_type;
+            let length = (intervals[i] as f32 / fundamental_appeal.0 as f32).round() as usize;
+            strokes.push(Stroke { onset_type, length });
+        }
+        strokes
+    }
+}
 
 pub struct RhythmData {
-    pub kicks: Vec<KickOnset>,
-    pub snares: Vec<SnareOnset>,
+    pub pulses: Vec<Pulse>,
     pub step_count: usize,
     pub tempo: f32,
 }
@@ -41,8 +99,7 @@ impl RhythmData {
         OCC: OemCpConverter,
     {
         let mut rhythm = Self {
-            kicks: Vec::new(),
-            snares: Vec::new(),
+            pulses: Vec::new(),
             step_count: 0,
             tempo: 0.,
         };
@@ -108,7 +165,7 @@ impl RhythmData {
                     }
                 } else {
                     last_onset = Some(Onset {
-                        offset: file.stream_position().await? / SEEK_LEN as u64,
+                        position: file.stream_position().await? / SEEK_LEN as u64,
                         spectrum: last_spectrum,
                     });
                 }
@@ -132,9 +189,15 @@ impl RhythmData {
         let mid = skews.iter().sum::<f32>() / skews.len() as f32;
         for (i, &skew) in skews.iter().enumerate() {
             if skew > mid {
-                rhythm.snares.push(SnareOnset(onsets[i].offset * SEEK_LEN as u64));
+                rhythm.pulses.push(Pulse {
+                    onset_type: OnsetType::Snare,
+                    position: onsets[i].position * SEEK_LEN as u64,
+                });
             } else {
-                rhythm.kicks.push(KickOnset(onsets[i].offset * SEEK_LEN as u64));
+                rhythm.pulses.push(Pulse {
+                    onset_type: OnsetType::Kick,
+                    position: onsets[i].position * SEEK_LEN as u64,
+                });
             }
         }
 
@@ -142,10 +205,10 @@ impl RhythmData {
         let intervals = onsets
             .windows(2)
             .flat_map(<&[Onset; 2]>::try_from)
-            .map(|[a, b]| b.offset - a.offset)
+            .map(|[a, b]| b.position - a.position)
             .collect::<Vec<_>>();
         let mut fundamental_appeal = (0, 0.);
-        for period in 9..*intervals.iter().max().unwrap() {
+        for period in 9..*intervals.iter().max().unwrap() { // start at hop period of 20Hz
             let (mut mean_sin, mut mean_cos) = intervals.iter().fold((0., 0.), |acc, i| {
                 let (sin, cos) = (2. * core::f32::consts::PI * *i as f32 / period as f32).sin_cos();
                 (acc.0 + sin, acc.1 + cos)

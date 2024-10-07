@@ -38,7 +38,7 @@ pub struct Stroke {
 }
 
 pub struct ClaveBuilder {
-    onsets: Vec<super::rhythm::Pulse>,
+    onsets: Vec<Pulse>,
 }
 
 impl ClaveBuilder {
@@ -46,14 +46,14 @@ impl ClaveBuilder {
         Self { onsets: Vec::new() }
     }
 
-    pub fn push(&mut self, pulse: super::rhythm::Pulse) {
+    pub fn push(&mut self, pulse: Pulse) {
         self.onsets.push(pulse);
     }
 
-    pub fn bake(self) -> Vec<super::rhythm::Stroke> {
+    pub fn bake(self) -> Vec<Stroke> {
         let intervals = self.onsets
             .windows(2)
-            .flat_map(<&[super::rhythm::Pulse; 2]>::try_from)
+            .flat_map(<&[Pulse; 2]>::try_from)
             .map(|[a, b]| b.position - a.position)
             .collect::<Vec<_>>();
         let mut fundamental_appeal = (0, 0.);
@@ -84,7 +84,7 @@ impl ClaveBuilder {
 
 pub struct RhythmData {
     pub pulses: Vec<Pulse>,
-    pub step_count: usize,
+    pub step_length: f32,
     pub tempo: f32,
 }
 
@@ -100,7 +100,7 @@ impl RhythmData {
     {
         let mut rhythm = Self {
             pulses: Vec::new(),
-            step_count: 0,
+            step_length: 0.,
             tempo: 0.,
         };
 
@@ -222,8 +222,13 @@ impl RhythmData {
                 fundamental_appeal = (period, appeal);
             }
         }
-        rhythm.step_count = ((file_length - 44) as f32 / SEEK_LEN as f32 / fundamental_appeal.0 as f32).round() as usize;
-        rhythm.tempo = super::SAMPLE_RATE as f32 / fundamental_appeal.0 as f32 * 60. / SEEK_LEN as f32;
+        let quantum = ((file_length - 44) as f32 / fundamental_appeal.0 as f32).round() as u64;
+
+        rhythm.step_length = (file_length - 44) as f32 / quantum as f32;
+        rhythm.tempo = super::SAMPLE_RATE as f32
+            / rhythm.step_length
+            * 60.
+            / (SEEK_LEN / 2) as f32;
 
         Ok(rhythm)
     }

@@ -76,49 +76,49 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_rp::init(config);
 
-    // // pio state machine for SDIO output
-    // let mut pio0 = Pio::new(p.PIO0, Irqs);
-    // let clock_pin = pio0.common.make_pio_pin(p.PIN_10);
-    // let cmd_pin = pio0.common.make_pio_pin(p.PIN_11);
-    // let d0_pin = pio0.common.make_pio_pin(p.PIN_12);
-    // let d1_pin = pio0.common.make_pio_pin(p.PIN_13);
-    // let d2_pin = pio0.common.make_pio_pin(p.PIN_14);
-    // let d3_pin = pio0.common.make_pio_pin(p.PIN_15);
-    // let cmd_dma_ref = p.DMA_CH1.into_ref();
-    // let data_dma_ref = p.DMA_CH2.into_ref();
+    // pio state machine for SDIO output
+    let mut pio0 = Pio::new(p.PIO0, Irqs);
+    let clock_pin = pio0.common.make_pio_pin(p.PIN_10);
+    let cmd_pin = pio0.common.make_pio_pin(p.PIN_11);
+    let d0_pin = pio0.common.make_pio_pin(p.PIN_12);
+    let d1_pin = pio0.common.make_pio_pin(p.PIN_13);
+    let d2_pin = pio0.common.make_pio_pin(p.PIN_14);
+    let d3_pin = pio0.common.make_pio_pin(p.PIN_15);
+    let cmd_dma_ref = p.DMA_CH1.into_ref();
+    let data_dma_ref = p.DMA_CH2.into_ref();
 
-    // let sdio = sdio::Sdio::new(
-    //     pio0,
-    //     clock_pin,
-    //     cmd_pin,
-    //     d0_pin,
-    //     d1_pin,
-    //     d2_pin,
-    //     d3_pin,
-    //     cmd_dma_ref,
-    //     data_dma_ref,
-    // );
-    // spawner.must_spawn(handle_sdio(sdio));
+    let sdio = sdio::Sdio::new(
+        pio0,
+        clock_pin,
+        cmd_pin,
+        d0_pin,
+        d1_pin,
+        d2_pin,
+        d3_pin,
+        cmd_dma_ref,
+        data_dma_ref,
+    );
+    spawner.must_spawn(handle_sdio(sdio));
 
-    // // block on SDIO init
-    // while !BYTE_PIPE.is_full() {
-    //     embassy_time::Timer::after_millis(100).await;
-    // }
+    // block on SDIO init
+    while !BYTE_PIPE.is_full() {
+        embassy_time::Timer::after_millis(100).await;
+    }
 
-    // // pio state machine for I2S output
-    // let mut pio1 = Pio::new(p.PIO1, Irqs);
-    // let bit_clock_pin = pio1.common.make_pio_pin(p.PIN_18);
-    // let left_right_clock_pin = pio1.common.make_pio_pin(p.PIN_19);
-    // let data_pin = pio1.common.make_pio_pin(p.PIN_20);
-    // let dma_ref = p.DMA_CH0.into_ref();
+    // pio state machine for I2S output
+    let mut pio1 = Pio::new(p.PIO1, Irqs);
+    let bit_clock_pin = pio1.common.make_pio_pin(p.PIN_18);
+    let left_right_clock_pin = pio1.common.make_pio_pin(p.PIN_19);
+    let data_pin = pio1.common.make_pio_pin(p.PIN_20);
+    let dma_ref = p.DMA_CH0.into_ref();
 
-    // spawner.must_spawn(handle_i2s(
-    //     pio1,
-    //     bit_clock_pin,
-    //     left_right_clock_pin,
-    //     data_pin,
-    //     dma_ref,
-    // ));
+    spawner.must_spawn(handle_i2s(
+        pio1,
+        bit_clock_pin,
+        left_right_clock_pin,
+        data_pin,
+        dma_ref,
+    ));
 
     macro_rules! new_input {
         ( $x:expr ) => {
@@ -310,8 +310,10 @@ async fn handle_i2s(
 async fn handle_sdio(
     mut sdio: sdio::Sdio<'static, PIO0>,
 ) {
-    use embedded_io_async::{Read, Seek, SeekFrom};
-    sdio.init_card().await.unwrap();
+    while let Err(e) = sdio.init_card().await {
+        defmt::error!("failed to init sd, retrying: {}", defmt::Debug2Format(&e));
+        embassy_time::Timer::after_millis(100).await;
+    }
 
     let sdio_device = fs::SdioDevice::new(sdio);
     let slice = sdio_device.into_stream_slice().await.unwrap();
@@ -319,18 +321,11 @@ async fn handle_sdio(
     let fs = embedded_fatfs::FileSystem::new(slice, fs_options).await.unwrap();
     let root = fs.root_dir();
 
-    let mut file = root.open_file("amen441mono.wav").await.unwrap();
-    let file_length = root.open_meta("amen441mono.wav").await.unwrap().len();
-
-    let rhythm = audio::rhythm::RhythmData::new(&mut file, file_length).await.unwrap();
-    defmt::info!("{} pulses: {}", rhythm.pulses.len(), defmt::Debug2Format(&rhythm.pulses[..8]));
-    defmt::info!("tempo: {} || step_count: {}", rhythm.tempo, rhythm.step_count);
-
+    let mut steps = audio::steps::Steps::new(root).await.unwrap();
     defmt::debug!("successfully initialized sdio!");
-    file.seek(SeekFrom::Start(44)).await.unwrap();
     loop {
         let mut buffer = [0u8; GRAIN_LEN * 2];
-        file.read_exact(&mut buffer).await.unwrap();
+        steps.read(&mut buffer).await.unwrap();
         BYTE_PIPE.write_all(&buffer).await;
     }
 }

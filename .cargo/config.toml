@@ -12,8 +12,8 @@ rustflags = [
 target = "thumbv6m-none-eabi"
 
 [env]
-# DEFMT_LOG = "trace"
-DEFMT_LOG = "debug"
+DEFMT_LOG = "trace"
+# DEFMT_LOG = "debug"
 
 [unstable]
 build-std = ["core", "alloc"]

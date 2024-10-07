@@ -395,7 +395,6 @@ impl<'d, T: Instance> Sdio<'d, T> {
                 direction: ShiftDirection::Left,
                 auto_fill: true,
             };
-            // config.fifo_join = FifoJoin::RxOnly;
             config.clock_divider = DATA_CLK_DIVIDER.to_fixed();
             config
         };
@@ -449,13 +448,12 @@ impl<'d, T: Instance> Sdio<'d, T> {
         // for _ in 0..(110_250_000 / 400_000 * 74) {
         //     cortex_m::asm::nop();
         // }
-
         self.send_cmd(Cmd::cmd0()).await?;
         while self.send_cmd(Cmd::cmd8(0x45)).await.is_err() {
             self.send_cmd(Cmd::cmd0()).await?;
             embassy_time::Timer::after_millis(1).await;
         }
-        
+
         let start_instant = embassy_time::Instant::now();
 
         let mut ready = false;
